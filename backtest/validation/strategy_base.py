@@ -390,8 +390,10 @@ class MCPTTester:
         if perm_kwargs is None:
             perm_kwargs = {}
 
-        # For walk-forward MCPT, always permute from start_index=0
-        # This is safe now because returns are pre-calculated before permutation
+        # Permute from start_index=0, i.e. the first training window too. Each
+        # permuted series then goes through the SAME retrain-and-trade procedure as
+        # the real one, so the null is "no temporal structure anywhere" and the
+        # optimiser's own selection effect is part of both distributions.
         merged_perm_kwargs = {'start_index': 0, **perm_kwargs}
 
         return self._run_permutation_test(

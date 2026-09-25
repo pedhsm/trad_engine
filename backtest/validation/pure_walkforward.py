@@ -23,7 +23,8 @@ def main(ohlc: pd.DataFrame,
          start_date: Optional[str] = None,
          end_date: Optional[str] = None,
          train_lookback: Optional[int] = None,
-         train_step: Optional[int] = None):
+         train_step: Optional[int] = None,
+         plot: bool = True):
     """
     Args:
         strategy_name: Name of strategy to test
@@ -96,12 +97,14 @@ def main(ohlc: pd.DataFrame,
             else:
                 print(f"{key}: {value}")
 
-        plot_walkforward_results(strategy.name, metrics.get('Profit factor', 0.0), cum_returns)
+        if plot and plt is not None:
+            plot_walkforward_results(strategy.name, metrics.get('Profit factor', 0.0), cum_returns)
 
         results = {
             'strategy_name': strategy.name,
             'metrics': metrics,
             'cum_returns': cum_returns,
+            'signal': signal,
             'train_lookback': train_lookback,
             'train_step': train_step
         }

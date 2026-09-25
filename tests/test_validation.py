@@ -88,3 +88,21 @@ def test_frozen_meta_model_propagates_nan():
              "coef": [1.0], "intercept": 0.0, "decision_threshold": 0.5}
     out = apply_meta_model(pd.DataFrame({"a": [0.0, np.nan]}), model)
     assert out.iloc[0] == pytest.approx(0.5) and np.isnan(out.iloc[1])
+
+
+# --- walk-forward bookkeeping ------------------------------------------------
+
+def test_hybrid_walkforward_never_trades_its_first_training_window():
+    from backtest.validation import hybrid_walkforward
+    res = hybrid_walkforward.main(_ohlc(1200), "example: donchian", holdout_months=3, plot=False)
+    lb = res["train_lookback"]
+    assert (res["dev_signal"].iloc[:lb] == 0).all()   # in-sample bars: no position
+    assert (res["dev_signal"].iloc[lb:] != 0).any()
+
+
+def test_pure_walkforward_shifts_the_signal_exactly_once():
+    from backtest.validation import pure_walkforward
+    df = _ohlc(1200)
+    res = pure_walkforward.main(df, "example: donchian", train_lookback=400, train_step=200, plot=False)
+    expected = (res["signal"].shift(1) * np.log(df["close"]).diff()).cumsum()
+    pd.testing.assert_series_equal(res["cum_returns"], expected, check_names=False)

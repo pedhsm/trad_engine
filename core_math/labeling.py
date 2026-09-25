@@ -27,8 +27,9 @@ def apply_triple_barrier(
     Entry price = first ``mid`` quote timestamped >= the event ts (searchsorted,
     never an earlier quote -- avoids entry lookahead). Walks forward to the vertical
     barrier (max_holding_min) looking for which profit/stop barrier is touched
-    first. If none is touched, label=0 (timeout) and t_end = the vertical barrier
-    (or last available quote, whichever comes first).
+    first, using only quotes timestamped <= the vertical barrier. If none is touched,
+    label=0 (timeout) and t_end = the last quote at or before the vertical barrier
+    (or the last available quote, if the data ends first).
 
     Returns: event_ts (the raw event timestamp, before it is snapped to the entry
     quote), t_start (real entry timestamp), bet_direction, label (+1 profit /
@@ -44,11 +45,18 @@ def apply_triple_barrier(
         entry_ts = mid.index[idx_entry]
         entry_price = mid.iloc[idx_entry]
 
+        if idx_entry == len(mid) - 1:
+            continue  # no quote after the entry: nothing to label
         vertical_ts = ts + pd.Timedelta(minutes=max_holding_min)
-        idx_vert = mid.index.searchsorted(vertical_ts)
-        idx_end = min(idx_vert, len(mid) - 1)
-        if idx_end <= idx_entry:
-            continue
+        # Last quote AT OR BEFORE the vertical barrier. A quote after it is outside
+        # the holding period: letting it hit a barrier would label the event with a
+        # move the position was never allowed to wait for.
+        idx_end = mid.index.searchsorted(vertical_ts, side="right") - 1
+        if idx_end < idx_entry:
+            continue  # the first quote after the event is already past the horizon
+        # idx_end == idx_entry (no new quote inside the horizon) is a timeout at the
+        # entry price, not a skip: dropping it would bias the sample against quiet
+        # periods.
         window = mid.iloc[idx_entry:idx_end + 1]
 
         profit_price = entry_price * (1 + d * profit_bps / 10000.0)
