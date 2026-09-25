@@ -29,3 +29,17 @@ C linkage so it loads via `ctypes`. If you compile it into a shared library
 (`micro.so` / `micro.dll` / `micro.dylib`) next to the sources, the benchmark
 detects and loads it, ready for a side-by-side comparison. Nothing here requires
 it — the Python-only run is complete on its own.
+
+## Latency of the live path
+
+`benchmark/latency.py` is the other half: not throughput over a batch of bars, but
+the time from one tick to one order, split into the C++ engine hot path, the Python
+strategy framework, the example signal, and the full round trip between the engine
+and a strategy in another process. See the "Latency" section of the main README for
+what each row covers and what it leaves out (the broker and the network).
+
+```bash
+python -m benchmark.latency            # (A) needs lib/client + ZeroMQ, else skipped
+python -m benchmark.latency --skip-cpp
+```
+

@@ -35,7 +35,6 @@ from typing import Deque, Optional
 
 import numpy as np
 
-from core_math.bars_math import sma
 from live import ipc
 from live.bar_aggregator import Bar, BarAggregator
 
@@ -56,14 +55,21 @@ class SmaCross:
     """Placeholder signal: +1 when the fast SMA is above the slow one, else -1."""
     fast: int = 10
     slow: int = 40
-    closes: Deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    closes: Deque[float] = field(default_factory=deque)
+
+    def __post_init__(self):
+        self.closes = deque(self.closes, maxlen=self.slow)  # keep only what the means use
 
     def on_bar(self, bar: Bar) -> Optional[int]:
         self.closes.append(bar.close)
         if len(self.closes) < self.slow:
             return None  # warmup: no opinion yet
-        c = np.fromiter(self.closes, dtype=float)
-        return 1 if sma(c, self.fast)[-1] > sma(c, self.slow)[-1] else -1
+        # Only the LAST value of each SMA is needed: the mean of the last `fast` and
+        # `slow` closes, the same formula as core_math.bars_math.sma. Calling sma()
+        # here (a whole-series pandas primitive, built for backtests) cost ~200 us
+        # per bar in pandas overhead alone — see benchmark/latency.py (B2).
+        c = np.fromiter(self.closes, dtype=float, count=len(self.closes))
+        return 1 if c[-self.fast:].mean() > c[-self.slow:].mean() else -1
 
 
 def ticker_id_from_config(config: dict, ticker: str) -> int:

@@ -123,6 +123,26 @@ them into the delta against the broker's position, keeps one order in flight per
 asset from the strategy's side, and flattens everything if the strategy's heartbeat
 goes silent or the daily loss limit is hit.
 
+## Latency
+
+`python -m benchmark.latency` measures the live path tick -> order, component by
+component, with every tick turned into an order (worst case). On a laptop (AMD Ryzen 5
+5600H, Windows 11, Python 3.12), in microseconds:
+
+| component | p50 | p99 | p99.9 |
+|---|---:|---:|---:|
+| (A) engine hot path, C++: broker callback -> arena record -> ZMQ publish | 0.3 | 0.5 | 3.2 |
+| (B1) strategy framework, Python: decode -> bar -> encode | 4.1 | 7.0 | 29.7 |
+| (B2) example signal (SMA cross) | 8.6 | 13.6 | 56.0 |
+| (C) round trip across processes: engine -> ZMQ -> strategy -> ZMQ -> engine | 273 | 435 | 487 |
+
+p50 is the median tick; p99 is what only 1 tick in 100 exceeds. The engine's own
+contribution is dominated by the two localhost ZMQ hops and the process wake-ups in
+(C), not by compute. What this does **not** include is the broker and the network
+(IB Gateway <-> exchange), which are milliseconds and dwarf all of the above — so
+these numbers say "the engine is not the bottleneck", not "this is an HFT stack".
+They depend on the machine; rerun them on yours.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party components keep their own licenses (the IBKR
