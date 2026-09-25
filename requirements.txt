@@ -8,5 +8,7 @@ scipy>=1.10
 duckdb>=0.9
 # Progress bars in the validation harness (degrades to a no-op if absent):
 tqdm>=4.0
+# ZeroMQ client for the live engine (live/ipc.py, examples/live_client.py):
+pyzmq>=25.0
 # Plotting in the validation harness (import is optional; only needed to draw):
 matplotlib>=3.5

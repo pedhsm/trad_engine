@@ -62,7 +62,7 @@ trad_engine/
 │   ├── engine/          # the backtest loop + trade metrics
 │   ├── validation/      # MCPT, walk-forward, bar-permutation, PIT invariants
 │   └── strategies/      # example strategies (bring your own for real use)
-├── live/                # trades -> bars (the shared glue of backtest and live loop)
+├── live/                # trades -> bars, and the Python side of the engine's IPC protocol
 ├── examples/            # runnable end-to-end paper-trading demo
 ├── benchmark/           # reproducible latency / throughput numbers
 └── tests/               # parity, causality, bar rules, validation mechanics
@@ -98,6 +98,30 @@ python -m backtest.engine.backtest --help
 pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+## Running live
+
+The live path is two processes talking over ZeroMQ on localhost: the C++ engine (broker
+connection, risk gate, watchdog) and a Python strategy. `examples/live_client.py` is a
+minimal, working strategy for the other end of the protocol; `live/ipc.py` is the wire
+format, checked field-by-field against the C++ structs in CI (`tests/test_ipc.py`).
+
+```bash
+# 1. build the engine (needs lib/client populated, ZeroMQ, CMake)
+cmake -S cpp_engine -B build && cmake --build build
+
+# 2. start IB Gateway (paper account, API on port 4002), then the engine
+./build/trad_engine --live --mode listen_only --config examples/engine_config.example.json
+
+# 3. start the strategy with the SAME config (dry run: prints decisions, sends nothing)
+python -m examples.live_client --config examples/engine_config.example.json --ticker SPY
+#    add --send-orders to actually send target positions through the engine's risk gate
+```
+
+The strategy sends **target positions**, not orders ("I want +1"); the engine turns
+them into the delta against the broker's position, keeps one order in flight per
+asset from the strategy's side, and flattens everything if the strategy's heartbeat
+goes silent or the daily loss limit is hit.
 
 ## License
 

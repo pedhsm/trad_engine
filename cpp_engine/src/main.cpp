@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
 
     std::string exec_mode;       // --live or --historical
     std::string record_mode;   // listen_only, record_local, record_cloud
-    std::string config_path = "live/params_portfolio_1.json";  // default
+    std::string config_path = "config.json";  // default; see examples/engine_config.example.json
 
     // DEFAULT data mode for the run. TICK_L2 keeps the historical behavior:
     // whoever passes nothing keeps receiving exactly what they received before.
