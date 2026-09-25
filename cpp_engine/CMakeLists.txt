@@ -8,10 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # NOT shipped with this repo (IB's API is not redistributable). You supply it in
 # ../lib/client — see lib/client/README.md for how to populate it.
 set(IB_CLIENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../lib/client")
-file(GLOB IB_CLIENT_SOURCES "${IB_CLIENT_DIR}/*.cpp")
-if(NOT IB_CLIENT_SOURCES)
+# TwsApiL0.cpp is a unity build: it #includes EPosixClientSocket.cpp and
+# EClientSocketBase.cpp itself, so it is the ONLY client source to compile (globbing
+# *.cpp would compile those twice and fail at link time with duplicate symbols).
+set(IB_CLIENT_SOURCES "${IB_CLIENT_DIR}/TwsApiL0.cpp")
+if(NOT EXISTS "${IB_CLIENT_SOURCES}")
     message(FATAL_ERROR
-        "No .cpp sources found in ${IB_CLIENT_DIR}. Populate it with the IB TWS API / "
+        "${IB_CLIENT_SOURCES} not found. Populate lib/client with the IB TWS API / "
         "TwsApiC++ before building — see lib/client/README.md.")
 endif()
 
@@ -20,6 +23,10 @@ add_executable(trad_engine
     src/AllocatorArena.cpp
     ${IB_CLIENT_SOURCES}
 )
+
+# std::string instead of MFC's CString inside the IB client (the engine header sets
+# it too, but TwsApiL0.cpp is compiled on its own).
+target_compile_definitions(trad_engine PRIVATE IB_USE_STD_STRING $<$<PLATFORM_ID:Windows>:WIN32>)
 
 target_include_directories(trad_engine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

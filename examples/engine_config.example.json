@@ -14,6 +14,7 @@
     "max_lot_size": 10,
     "max_orders_per_day": 50,
     "max_concurrent_orders": 2,
-    "watchdog_timeout_ms": 5000
+    "watchdog_timeout_ms": 5000,
+    "day_reset_utc_hour": 0
   }
 }

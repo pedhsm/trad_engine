@@ -170,6 +170,12 @@ def test_live_client_against_fake_engine():
         eng.trade(8, 60)  # closes the minute-7 bar -> target -1 goes out now
         assert _pump(client, lambda: client.targets_sent == [1, -1])
 
+        # A REJECTED target unlocks the asset and is re-armed (not remembered as reached).
+        assert eng.pull.poll(2000)
+        eng.pull.recv()
+        eng.exec_pub.send(ipc.encode_execution(0.0, 1, 0, ipc.STATUS_REJECTED, 0, 2))
+        assert _pump(client, lambda: not client.order_in_flight and client.last_target is None)
+
         # Broker reconciliation and the strategy heartbeat.
         eng.pub.send_multipart([b"POSITIONS", ipc.encode_position(1, 1, 104.0)])
         assert _pump(client, lambda: client.position == 1)

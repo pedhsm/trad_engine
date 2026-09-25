@@ -1,21 +1,27 @@
 #pragma once
 #include <cstddef>
 
+// Bump allocator over one fixed buffer: allocate() hands out the next `bytes`, reset()
+// forgets everything at once. No per-allocation free, no system call after the
+// constructor — which is what makes it usable on the market-data hot path.
 class ArenaAllocator {
 private:
-    char* buffer_inicio;
-    size_t tamanho_total;
-    size_t offset_atual;
+    char* buffer_start;
+    size_t total_size;
+    size_t offset;
 
 public:
-    ArenaAllocator(size_t tamanho_em_bytes); 
-    ~ArenaAllocator();            
-    
-    void* alocar(size_t bytes_necessarios);    
-    void resetar();
+    explicit ArenaAllocator(size_t size_bytes);
+    ~ArenaAllocator();
+    ArenaAllocator(const ArenaAllocator&) = delete;
+    ArenaAllocator& operator=(const ArenaAllocator&) = delete;
 
-    // Acessores para o sistema de Ping-Pong (usados pela thread de drain)
-    const char* getBuffer()    const { return buffer_inicio; }
-    size_t      getUsedBytes() const { return offset_atual;  }
-    size_t      getCapacity()  const { return tamanho_total;  }
+    // nullptr when the arena has no room left (the caller decides what to drop).
+    void* allocate(size_t bytes);
+    void reset();
+
+    // Accessors for the ping-pong drain thread.
+    const char* getBuffer()    const { return buffer_start; }
+    size_t      getUsedBytes() const { return offset; }
+    size_t      getCapacity()  const { return total_size; }
 };

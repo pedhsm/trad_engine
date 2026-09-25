@@ -48,6 +48,28 @@
 using json = nlohmann::json;
 
 // ==========================================
+// RECORDING FRAME (arena -> disk)
+// ==========================================
+// The arena holds records of every asset and kind back to back. Each payload is
+// preceded by this header so the drain thread can route it to its own per-ticker
+// file (`data/<T>/<T>_L1.bin`, `_L2.bin`, `_TRADE.bin`). The files themselves
+// contain only the raw payloads, exactly as before.
+enum RecordKind : int32_t {
+    REC_L1 = 1,      // payload: L2Update (top of book, position 0)
+    REC_L2 = 2,      // payload: L2Update (depth level)
+    REC_TRADE = 3,   // payload: TradeUpdate
+};
+
+struct RecordHeader {
+    int32_t tickerId;
+    int32_t kind;    // RecordKind
+};
+
+static size_t recordPayloadSize(int32_t kind) {
+    return kind == REC_TRADE ? sizeof(TradeUpdate) : sizeof(L2Update);
+}
+
+// ==========================================
 // PER-ASSET DATA MODE (Phase 6)
 // ==========================================
 // Generalizes the old boolean flag `use_l1`. Each asset declares which data it
@@ -86,24 +108,36 @@ class HFTEngine: public EWrapperL0 {
         EClientL0* ptr_begin;
 
         // ===== PING-PONG BUFFER (Double Arena) =====
-        // Two identical arenas. The ingestion thread writes ONLY to the active arena.
-        // When the active arena fills up (>= THRESHOLD), we do an atomic swap and the
-        // drain thread writes the inactive arena to disk and resets it.
+        // The market-data callbacks never touch the disk. They copy each record
+        // (header + payload) into the ACTIVE arena; when it passes SWAP_THRESHOLD
+        // of its capacity, or SWAP_INTERVAL has elapsed, the callback thread flips
+        // `active_arena` and the drain thread writes the other arena to the
+        // per-ticker files and resets it. Publishing on ZMQ does not depend on
+        // any of this: a full arena drops the RECORD (and counts it), never the
+        // live message.
         ArenaAllocator* arenas[2];
         std::atomic<int> active_arena;    // 0 or 1 — index of the write arena
 
-        // Lock-free signaling to the drain thread
         std::mutex              drain_mutex;
         std::condition_variable drain_cv;
-        std::atomic<bool>       drain_pendente;  // flag: is there an arena to drain?
+        std::atomic<bool>       drain_pending;  // is there an arena to drain?
         int                     arena_to_drain; // index of the arena to be drained
         std::thread             thread_drain;
+        std::chrono::steady_clock::time_point last_swap;
 
-        // File and name routers
-        std::unordered_map<int, FILE*> file_map;
+        // Shutdown quiescence: record() counts itself in and out, so the final
+        // flush can wait until no callback is mid-copy before reading the arenas.
+        std::atomic<bool> recording_open{true};
+        std::atomic<int>  writers_in_record{0};
+        std::atomic<uint64_t> dropped_records{0};
+        std::atomic<bool> backpressure_warned{false};
+
+        // File and name routers. The FILE* maps are written ONLY by the drain
+        // thread (and by the final flush, after that thread has been joined).
+        std::unordered_map<int, FILE*> file_map;       // <name>_L2.bin (depth)
         std::unordered_map<int, std::string> ticker_names;
         std::unordered_map<int, Contract> contract_map;
-        std::unordered_map<int, FILE*> file_map_l1;
+        std::unordered_map<int, FILE*> file_map_l1;    // <name>_L1.bin (top of book)
         // Trade trail (`<name>_TRADE.bin`). Without it there is no way to answer
         // later "which bar produced this order?" — a question any risk
         // desk asks, and that the order log alone does not answer.
@@ -121,7 +155,10 @@ class HFTEngine: public EWrapperL0 {
         std::unordered_map<int, DataMode> ticker_modes;
         std::unordered_map<int, TradeCache> trade_cache;
 
-        // Position cache (Target Position Routing)
+        // Position cache (Target Position Routing). Seeded by the broker's
+        // position() callbacks and updated from our own fills (orderStatus), so
+        // a target arriving right after a fill is not computed against the
+        // pre-fill position.
         std::unordered_map<int, std::atomic<int>> current_positions;
 
         // Per-ticker PnL tracking via IBKR
@@ -142,16 +179,25 @@ class HFTEngine: public EWrapperL0 {
         std::atomic<bool> liquidation_triggered{false};
         std::thread watchdog_thread;
 
-        // orderId -> tickerId (IPC v2)
+        // Live orders sent by the engine: orderId -> {asset, position when sent,
+        // direction}.
         //
-        // The IBKR orderStatus callback delivers only the orderId, but the Python
-        // side needs to know the asset. This map is the only bridge between the two.
+        // The IBKR orderStatus callback delivers only the orderId; this map is
+        // the bridge to the asset (for the ExecutionReport) and to the position
+        // the order leads to: pos_at_send + direction * filled. That value is
+        // ABSOLUTE, not a delta, so applying it is idempotent even when the
+        // broker's position() update for the same fill arrives first.
         //
         // CONCURRENCY: written by the orders-loop thread (ZMQ) and read by the
         // IBKR callback thread. Every access goes under order_map_mutex, and the
         // lookup uses find() — never operator[], which INSERTS when the key does
         // not exist and would cause a concurrent write to the map structure.
-        std::unordered_map<int, int> order_to_ticker;
+        struct OrderInfo {
+            int tickerId;
+            int pos_at_send;
+            int direction;   // +1 buy, -1 sell
+        };
+        std::unordered_map<int, OrderInfo> order_info;
         std::mutex order_map_mutex;
 
         zmq::context_t zmq_ctx;
@@ -160,7 +206,8 @@ class HFTEngine: public EWrapperL0 {
         zmq::socket_t zmq_exec_pub;
         zmq::socket_t zmq_hb_pub;
         zmq::socket_t zmq_hb_sub;   // strategy liveness signal (5559)
-        std::mutex zmq_pub_mutex;
+        std::mutex zmq_pub_mutex;   // zmq_pub is shared by the callback thread paths
+        std::mutex zmq_exec_mutex;  // zmq_exec_pub: orders thread AND callback thread
 
         std::thread execution_thread;
         std::thread thread_heartbeat;
@@ -168,8 +215,11 @@ class HFTEngine: public EWrapperL0 {
         std::atomic<int> next_order_id;
         ExecutionRiskManager risk_manager;
 
-        // Swap threshold: 90% of the arena capacity
+        // Swap when the active arena is 90% full, or at least once per interval
+        // while it holds data: a quiet market must not leave hours of records in
+        // RAM, where a crash would lose them.
         static constexpr double SWAP_THRESHOLD = 0.90;
+        static constexpr std::chrono::milliseconds SWAP_INTERVAL{1000};
 
     public:
         void requestPortfolioUpdates() {
@@ -178,8 +228,9 @@ class HFTEngine: public EWrapperL0 {
             }
         }
 
-        HFTEngine(ArenaAllocator* arena_a, ArenaAllocator* arena_b, OperationMode mode) 
-            : op_mode(mode), active_arena(0), drain_pendente(false), arena_to_drain(-1),
+        HFTEngine(ArenaAllocator* arena_a, ArenaAllocator* arena_b, OperationMode mode)
+            : op_mode(mode), active_arena(0), drain_pending(false), arena_to_drain(-1),
+              last_swap(std::chrono::steady_clock::now()),
               zmq_ctx(1), zmq_pub(zmq_ctx, zmq::socket_type::pub),
               zmq_pull(zmq_ctx, zmq::socket_type::pull),
               zmq_exec_pub(zmq_ctx, zmq::socket_type::pub),
@@ -204,26 +255,24 @@ class HFTEngine: public EWrapperL0 {
         ~HFTEngine(){
             engine_running = false;
 
-            // Wake the drain thread so it can shut down
+            // 1. Stop the broker callbacks first: after this nothing new enters
+            //    the arenas.
+            if (ptr_begin) ptr_begin->eDisconnect();
+
+            // 2. Stop the worker threads.
             drain_cv.notify_one();
             if(thread_drain.joinable()) thread_drain.join();
-
             if(execution_thread.joinable()) execution_thread.join();
             if(thread_heartbeat.joinable()) thread_heartbeat.join();
             if(watchdog_thread.joinable()) watchdog_thread.join();
 
-            if (ptr_begin) {
-                ptr_begin->eDisconnect();
-                delete ptr_begin;
-            }
-            if (op_mode != OperationMode::LISTEN_ONLY) {
-                for (auto& kv : file_map) {
-                    if (kv.second) fclose(kv.second);
-                }
-                for (auto& kv : file_map_l1) {
-                    if (kv.second) fclose(kv.second);
-                }
-                for (auto& kv : file_map_trade) {
+            // 3. Flush what is still in RAM. Before, the active arena (up to 45 MB
+            //    of records) was simply discarded on shutdown.
+            flushRecordingOnShutdown();
+
+            delete ptr_begin;
+            for (auto* m : {&file_map, &file_map_l1, &file_map_trade}) {
+                for (auto& kv : *m) {
                     if (kv.second) fclose(kv.second);
                 }
             }
@@ -305,44 +354,29 @@ class HFTEngine: public EWrapperL0 {
 
             if (op_mode != OperationMode::LISTEN_ONLY) {
                 // ── Multi-Ticker: Partitions data by ticker folder ──
-                // data/EURUSD/EURUSD_L2.bin, data/GC/GC_L2.bin, etc.
+                // data/EURUSD/EURUSD_L2.bin, data/GC/GC_L2.bin, etc. One file per
+                // kind of data the asset actually receives: an empty .bin for data
+                // that will never arrive just creates junk on disk.
                 std::string ticker_dir = "data/" + asset_name;
 #ifdef _WIN32
+                CreateDirectoryA("data", NULL);
                 CreateDirectoryA(ticker_dir.c_str(), NULL);
 #else
+                mkdir("data", 0755);
                 mkdir(ticker_dir.c_str(), 0755);
 #endif
-
-                // Setup L2 — disk write (partitioned)
-                std::string l2_filename = ticker_dir + "/" + asset_name + "_L2.bin";
-                FILE* f_l2 = fopen(l2_filename.c_str(),"ab");
-                if (f_l2) {
-                    file_map[tickerId] = f_l2;
-                } else {
-                    std::cout << "[ERROR] Failed to open " << l2_filename << std::endl;
-                }
-
-                // Setup L1 — disk write (partitioned)
-                std::string l1_filename = ticker_dir + "/" + asset_name + "_L1.bin";
-                FILE* f_l1 = fopen(l1_filename.c_str(),"ab");
-                if (f_l1) {
-                    file_map_l1[tickerId] = f_l1;
-                } else {
-                    std::cout << "[ERROR] Failed to open " << l1_filename << std::endl;
-                }
-
-                // Setup TRADE — only for those subscribed to trades. Opening an
-                // empty .bin for an asset that will never receive a trade just
-                // creates junk on disk.
-                if (wantsTrades(mode)) {
-                    std::string trade_filename = ticker_dir + "/" + asset_name + "_TRADE.bin";
-                    FILE* f_trade = fopen(trade_filename.c_str(),"ab");
-                    if (f_trade) {
-                        file_map_trade[tickerId] = f_trade;
+                auto openLog = [&](const char* suffix, std::unordered_map<int, FILE*>& target) {
+                    std::string filename = ticker_dir + "/" + asset_name + suffix;
+                    FILE* f = fopen(filename.c_str(), "ab");
+                    if (f) {
+                        target[tickerId] = f;
                     } else {
-                        std::cout << "[ERROR] Failed to open " << trade_filename << std::endl;
+                        std::cout << "[ERROR] Failed to open " << filename << std::endl;
                     }
-                }
+                };
+                if (wantsBook(mode))                                 openLog("_L2.bin", file_map);
+                if (mode == DataMode::TICK_L1 || mode == DataMode::BOTH) openLog("_L1.bin", file_map_l1);
+                if (wantsTrades(mode))                               openLog("_TRADE.bin", file_map_trade);
             }
 
             // ── Market subscriptions — ALWAYS active (regardless of the
@@ -356,10 +390,10 @@ class HFTEngine: public EWrapperL0 {
                 ptr_begin->reqMktDepth(tickerId, contract, 3, TagValueListSPtr());
             }
             if (mode == DataMode::TICK_L1 || wantsTrades(mode)) {
-                const char* rotulo = wantsTrades(mode)
+                const char* label = wantsTrades(mode)
                     ? "trades (LAST/LAST_SIZE) for OHLCV bars"
                     : "Level 1 (Top of Book)";
-                std::cout << "[INFO] " << asset_name << ": " << rotulo << " via reqMktData" << std::endl;
+                std::cout << "[INFO] " << asset_name << ": " << label << " via reqMktData" << std::endl;
                 ptr_begin->reqMktData(tickerId, contract, "233", false, TagValueListSPtr());
             }
         }
@@ -384,7 +418,34 @@ class HFTEngine: public EWrapperL0 {
             }
         }
 
-        // --- EXECUTION THREAD (Receives orders from Python) ---
+        // One ExecutionReport on 5557. Called from the orders thread AND the IBKR
+        // callback thread, hence the mutex: a zmq socket is not thread-safe.
+        void publishExecution(double price, int tickerId, int orderId, int status,
+                              int filled, int remaining) {
+            ExecutionReport report;
+            report.version = IPC_PROTOCOL_VERSION;
+            memset(report.reserved, 0, sizeof(report.reserved));
+            report.price = price;
+            report.tickerId = tickerId;
+            report.orderId = orderId;
+            report.status = status;
+            report.filled = filled;
+            report.remaining = remaining;
+            zmq::message_t msg(sizeof(report));
+            memcpy(msg.data(), &report, sizeof(report));
+            std::lock_guard<std::mutex> lock(zmq_exec_mutex);
+            zmq_exec_pub.send(msg, zmq::send_flags::dontwait);
+        }
+
+        bool orderInFlight(int tickerId) {
+            std::lock_guard<std::mutex> lock(order_map_mutex);
+            for (const auto& kv : order_info) {
+                if (kv.second.tickerId == tickerId) return true;
+            }
+            return false;
+        }
+
+        // --- EXECUTION THREAD (Receives target positions from the strategy) ---
         void executionLoop(){
             int timeout = 1000;
             zmq_pull.set(zmq::sockopt::rcvtimeo, timeout);
@@ -392,90 +453,96 @@ class HFTEngine: public EWrapperL0 {
             while (engine_running){
                 zmq::message_t msg;
                 auto recv_ok = zmq_pull.recv(msg, zmq::recv_flags::none);
+                if (!recv_ok) continue;
 
-                if (recv_ok) {
-                    // --- MEMORY DEBUG MODE ENABLED ---
-                    if (msg.size() != sizeof(TargetPositionRequest)) {
-                        std::cout << "\n[ZMQ MEMORY ERROR] PADDING ALERT!" << std::endl;
-                        std::cout << "-> Python sent    : " << msg.size() << " bytes." << std::endl;
-                        std::cout << "-> C++ struct has : " << sizeof(TargetPositionRequest) << " bytes." << std::endl;
-                        std::cout << "Fix: adjust the struct.pack mask in Python to match the C++ layout.\n" << std::endl;
-                        continue;
-                    }
-
-                    TargetPositionRequest* req = static_cast<TargetPositionRequest*>(msg.data());
-
-                    // ── IPC v1: Protocol version validation ──
-                    if (req->version != IPC_PROTOCOL_VERSION) {
-                        std::cout << "[IPC ERROR] Unknown version in TargetPositionRequest: "
-                                  << (int)req->version << " (expected: " << IPC_PROTOCOL_VERSION
-                                  << ")" << std::endl;
-                        continue;
-                    }
-                    
-                    // find() and not operator[]: the tickerId comes from the
-                    // Python payload and operator[] INSERTS when the key does not
-                    // exist — a write to the map structure, on the orders thread,
-                    // while the watchdog thread may be iterating the same map to
-                    // flatten. Besides, an id outside the config should never
-                    // become an order.
-                    auto it_pos = current_positions.find(req->tickerId);
-                    if (it_pos == current_positions.end()) {
-                        std::cerr << "[IPC ERROR] tickerId " << req->tickerId
-                                  << " is not registered in the engine. Order DISCARDED."
-                                  << std::endl;
-                        continue;
-                    }
-                    int current_pos = it_pos->second.load();
-                    int quantity = 0;
-                    std::string order_action = "";
-
-                    if (!risk_manager.approveTargetOrder(req->tickerId, req->target_position, current_pos, req->price, req->orderType, quantity, order_action)){
-                        if (req->target_position == current_pos) {
-                            ExecutionReport report;
-                            report.version = IPC_PROTOCOL_VERSION;
-                            memset(report.reserved, 0, sizeof(report.reserved));
-                            report.price = req->price;
-                            report.tickerId = req->tickerId;
-                            report.orderId = 0;
-                            report.status = 2; // FILLED
-                            report.filled = 0;
-                            report.remaining = 0;
-                            zmq::message_t msg_exec(&report, sizeof(report));
-                            zmq_exec_pub.send(msg_exec, zmq::send_flags::dontwait);
-                            std::cout << "[SYSTEM] Target position already reached. Published sync fill for ticker " << req->tickerId << std::endl;
-                        }
-                        continue;
-                    }
-
-                    std::string tipo = (req->orderType == 1) ? "MKT":"LMT";
-
-                    std::cout << "\n >>> [TARGET POSITION] Ticker: " << req->tickerId
-                              << " | Current: " << current_pos << " -> Target: " << req->target_position
-                              << " | Sending: " << order_action << " " << quantity << " " << tipo << std::endl; 
-
-                    Order ib_order;
-                    ib_order.action = order_action;
-                    ib_order.totalQuantity = quantity;
-                    ib_order.orderType = tipo;
-                    if (req->orderType == 2) ib_order.lmtPrice = req->price;
-                    ib_order.eTradeOnly = false;
-                    ib_order.firmQuoteOnly = false;
-
-                    if (contract_map.find(req->tickerId) != contract_map.end()){
-                        int curr_id = next_order_id++;
-                        risk_manager.registerOrderStart(curr_id);
-
-                        // IPC v2: stores which asset this order belongs to, so
-                        // orderStatus (which only receives orderId) can inform Python.
-                        {
-                            std::lock_guard<std::mutex> lock(order_map_mutex);
-                            order_to_ticker[curr_id] = req->tickerId;
-                        }
-                        ptr_begin->placeOrder(curr_id, contract_map[req->tickerId], ib_order);
-                        std::cout << ">>> Order sent to IBKR!" << std::endl;
-                    }
+                if (msg.size() != sizeof(TargetPositionRequest)) {
+                    std::cout << "\n[IPC ERROR] TargetPositionRequest of " << msg.size()
+                              << " bytes, expected " << sizeof(TargetPositionRequest)
+                              << ". The strategy's struct layout does not match the engine's "
+                              << "(see live/ipc.py and tests/test_ipc.py)." << std::endl;
+                    continue;
                 }
+
+                // Copy out of the message buffer: the packed struct is read as a
+                // value, never through a possibly misaligned pointer.
+                TargetPositionRequest req;
+                memcpy(&req, msg.data(), sizeof(req));
+
+                if (req.version != IPC_PROTOCOL_VERSION) {
+                    std::cout << "[IPC ERROR] Unknown version in TargetPositionRequest: "
+                              << (int)req.version << " (expected: " << IPC_PROTOCOL_VERSION
+                              << ")" << std::endl;
+                    continue;
+                }
+
+                // find() and not operator[]: the tickerId comes from the
+                // strategy's payload and operator[] INSERTS when the key does not
+                // exist — a write to the map structure, on the orders thread,
+                // while the watchdog thread may be iterating the same map to
+                // flatten. Besides, an id outside the config should never
+                // become an order.
+                auto it_pos = current_positions.find(req.tickerId);
+                auto it_contract = contract_map.find(req.tickerId);
+                if (it_pos == current_positions.end() || it_contract == contract_map.end()) {
+                    std::cerr << "[IPC ERROR] tickerId " << req.tickerId
+                              << " is not registered in the engine. Order DISCARDED."
+                              << std::endl;
+                    publishExecution(req.price, req.tickerId, 0, EXEC_REJECTED, 0, 0);
+                    continue;
+                }
+                const int current_pos = it_pos->second.load();
+
+                if (req.target_position == current_pos) {
+                    // Already there: confirm, so a strategy waiting on this target unlocks.
+                    publishExecution(req.price, req.tickerId, 0, EXEC_FILLED, 0, 0);
+                    std::cout << "[SYSTEM] Target position already reached. Published sync fill for ticker "
+                              << req.tickerId << std::endl;
+                    continue;
+                }
+
+                // One order per asset at a time. The position only reflects a fill
+                // once the broker reports it; a second target computed before that
+                // would size its delta on the stale position and double the trade.
+                if (orderInFlight(req.tickerId)) {
+                    std::cout << "[RISK REJECT] Ticker " << req.tickerId
+                              << ": an order is still in flight. Target " << req.target_position
+                              << " refused; resend after its ExecutionReport." << std::endl;
+                    publishExecution(req.price, req.tickerId, 0, EXEC_REJECTED, 0,
+                                     std::abs(req.target_position - current_pos));
+                    continue;
+                }
+
+                int quantity = 0;
+                std::string order_action;
+                std::string reason;
+                if (!risk_manager.approveTargetOrder(req.target_position, current_pos, req.price,
+                                                     req.orderType, quantity, order_action, reason)) {
+                    publishExecution(req.price, req.tickerId, 0, EXEC_REJECTED, 0,
+                                     std::abs(req.target_position - current_pos));
+                    continue;
+                }
+
+                const std::string order_type = (req.orderType == 1) ? "MKT" : "LMT";
+                std::cout << "\n >>> [TARGET POSITION] Ticker: " << req.tickerId
+                          << " | Current: " << current_pos << " -> Target: " << req.target_position
+                          << " | Sending: " << order_action << " " << quantity << " " << order_type << std::endl;
+
+                Order ib_order;
+                ib_order.action = order_action;
+                ib_order.totalQuantity = quantity;
+                ib_order.orderType = order_type;
+                if (req.orderType == 2) ib_order.lmtPrice = req.price;
+                ib_order.eTradeOnly = false;
+                ib_order.firmQuoteOnly = false;
+
+                const int curr_id = next_order_id++;
+                risk_manager.registerOrderStart(curr_id);
+                {
+                    std::lock_guard<std::mutex> lock(order_map_mutex);
+                    order_info[curr_id] = OrderInfo{req.tickerId, current_pos, (order_action == "BUY") ? 1 : -1};
+                }
+                ptr_begin->placeOrder(curr_id, it_contract->second, ib_order);
+                std::cout << ">>> Order sent to IBKR!" << std::endl;
             }
         }
 
@@ -519,6 +586,10 @@ class HFTEngine: public EWrapperL0 {
 
                 if (!engine_running.load(std::memory_order_relaxed)) break;
 
+                // Resets the per-day order counter at the configured day boundary,
+                // even on a day with no orders at all.
+                risk_manager.rollDayIfNeeded();
+
                 // Condition 2 holds even before the strategy starts: if there is
                 // an open position from a previous session and the PnL breaches,
                 // the engine must act on its own.
@@ -534,11 +605,11 @@ class HFTEngine: public EWrapperL0 {
                 if (watchdog_armed.load()) {
                     auto now = std::chrono::steady_clock::now().time_since_epoch();
                     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
-                    int64_t silencio = now_ms - last_hb_ms.load();
+                    int64_t silence_ms = now_ms - last_hb_ms.load();
 
-                    if (silencio > timeout_ms) {
+                    if (silence_ms > timeout_ms) {
                         std::ostringstream reason;
-                        reason << "strategy silent for " << silencio << "ms (limit "
+                        reason << "strategy silent for " << silence_ms << "ms (limit "
                                << timeout_ms << "ms)";
                         haltAndLiquidate(reason.str());
                     }
@@ -566,9 +637,9 @@ class HFTEngine: public EWrapperL0 {
             risk_manager.activateKillSwitch();
 
             // (b) cancel pending orders
-            auto pendentes = risk_manager.activeOrders();
-            std::cout << "[HALT] Cancelling " << pendentes.size() << " pending order(s)." << std::endl;
-            for (int orderId : pendentes) {
+            auto pending = risk_manager.activeOrders();
+            std::cout << "[HALT] Cancelling " << pending.size() << " pending order(s)." << std::endl;
+            for (int orderId : pending) {
                 if (ptr_begin) ptr_begin->cancelOrder(orderId);
             }
 
@@ -586,7 +657,7 @@ class HFTEngine: public EWrapperL0 {
                 positions_to_flatten.emplace_back(kv.first, kv.second.load());
             }
 
-            int zeradas = 0;
+            int flattened = 0;
             for (const auto& kv : positions_to_flatten) {
                 int tickerId = kv.first;
                 int position = kv.second;
@@ -597,10 +668,10 @@ class HFTEngine: public EWrapperL0 {
                 std::cout << "[HALT] Ticker " << tickerId << ": position " << position
                           << " -> sending " << order_action << " " << qty << " at market." << std::endl;
                 sendEmergencyOrder(tickerId, order_action, qty);
-                zeradas++;
+                flattened++;
             }
 
-            if (zeradas == 0) {
+            if (flattened == 0) {
                 std::cout << "[HALT] No open position to flatten." << std::endl;
             }
             std::cout << "[HALT] Engine stays ALIVE, refusing new orders. "
@@ -635,7 +706,9 @@ class HFTEngine: public EWrapperL0 {
             risk_manager.registerOrderStart(orderId);
             {
                 std::lock_guard<std::mutex> lock(order_map_mutex);
-                order_to_ticker[orderId] = tickerId;
+                auto it_pos = current_positions.find(tickerId);
+                const int pos_now = (it_pos == current_positions.end()) ? 0 : it_pos->second.load();
+                order_info[orderId] = OrderInfo{tickerId, pos_now, (order_action == "BUY") ? 1 : -1};
             }
             if (ptr_begin) ptr_begin->placeOrder(orderId, it->second, order);
         }
@@ -675,8 +748,8 @@ class HFTEngine: public EWrapperL0 {
         }
 
         virtual void error(const int id, const int errorCode, const IBString errorString) override {
-            if (const char* nota = noticeText(errorCode)) {
-                std::cerr << "[IBKR " << errorCode << "] " << nota << std::endl;
+            if (const char* note = noticeText(errorCode)) {
+                std::cerr << "[IBKR " << errorCode << "] " << note << std::endl;
                 return;
             }
 
@@ -698,17 +771,7 @@ class HFTEngine: public EWrapperL0 {
 
         virtual void connectionClosed() override {
             std::cerr << "\n[DISCONNECT] CONNECTION TO THE IB GATEWAY DROPPED ABRUPTLY!\n" << std::endl;
-            ExecutionReport report;
-            report.version = IPC_PROTOCOL_VERSION;
-            memset(report.reserved, 0, sizeof(report.reserved));
-            report.price = 0.0;
-            report.tickerId = -1;
-            report.orderId = -1;
-            report.filled = 0;
-            report.remaining = 0;
-            report.status = 9; // Status 9: Broker Disconnect Alert
-            zmq::message_t msg(&report, sizeof(report));
-            zmq_exec_pub.send(msg, zmq::send_flags::dontwait);
+            publishExecution(0.0, -1, -1, EXEC_BROKER_DISCONNECT, 0, 0);
         }
 
         virtual void OnCatch(const char* MethodName, const long Id) override {
@@ -728,56 +791,55 @@ class HFTEngine: public EWrapperL0 {
         }
 
         virtual void orderStatus(OrderId orderId, const IBString &status, int filled,
-                                 int remaining, double avgFillPrice, int permId, int parentId,
-                                 double lastFillPrice, int clientId, const IBString& whyHeld) override {
-            ExecutionReport report;
-            report.version = IPC_PROTOCOL_VERSION;
-            memset(report.reserved, 0, sizeof(report.reserved));
-            report.price = avgFillPrice;
-            report.orderId = orderId;
+                                 int remaining, double avgFillPrice, int /*permId*/, int /*parentId*/,
+                                 double /*lastFillPrice*/, int /*clientId*/, const IBString& /*whyHeld*/) override {
+            int statusInt = EXEC_OTHER;
+            if (status == "Submitted") statusInt = EXEC_SUBMITTED;
+            else if (status == "Filled") statusInt = EXEC_FILLED;
+            else if (status == "Cancelled") statusInt = EXEC_CANCELLED;
+            else if (status == "PreSubmitted") statusInt = EXEC_PRESUBMITTED;
+            else if (status == "Inactive") statusInt = EXEC_INACTIVE;
+            const bool terminal = statusInt == EXEC_FILLED || statusInt == EXEC_CANCELLED
+                               || statusInt == EXEC_INACTIVE;
 
-            // IPC v2: resolves this order's asset. find() and not operator[],
-            // which inserts and would cause a concurrent write with the orders thread.
+            // Resolve the asset and the position this order leads to. find() and
+            // not operator[], which inserts and would race with the orders thread.
             int orderTickerId = -1;
             {
                 std::lock_guard<std::mutex> lock(order_map_mutex);
-                auto it = order_to_ticker.find(orderId);
-                if (it != order_to_ticker.end()) orderTickerId = it->second;
+                auto it = order_info.find(orderId);
+                if (it != order_info.end()) {
+                    const OrderInfo info = it->second;
+                    orderTickerId = info.tickerId;
+                    if (filled > 0) {
+                        // `filled` is cumulative, and the result is absolute: the
+                        // same value whether or not the broker's position() update
+                        // for this fill already arrived.
+                        auto it_pos = current_positions.find(info.tickerId);
+                        if (it_pos != current_positions.end()) {
+                            it_pos->second.store(info.pos_at_send + info.direction * filled);
+                        }
+                    }
+                    // Terminal state: frees the entry (unblocks the asset for the
+                    // next target, and keeps the map from growing unbounded).
+                    if (terminal) order_info.erase(it);
+                }
             }
-            report.tickerId = orderTickerId;
 
             if (orderTickerId == -1) {
                 // Order the engine did not originate (sent by hand via TWS, or a
-                // survivor of a restart). Reported anyway, with id -1, so Python
-                // can log it instead of being blind.
+                // survivor of a restart). Reported anyway, with id -1, so the
+                // strategy can log it instead of being blind.
                 std::cerr << "[EXECUTION] WARNING: orderId " << orderId
                           << " has no associated ticker (external order, or predates the restart)."
                           << std::endl;
             }
+            if (terminal) risk_manager.registerOrderClosed(orderId);
 
-            int statusInt = 0;
-            if (status == "Submitted") statusInt = 1;
-            else if (status == "Filled") statusInt = 2;
-            else if (status == "Cancelled") statusInt = 3;
-            else if (status == "PreSubmitted") statusInt = 4;
-            else if (status == "Inactive") statusInt = 5;
-            report.status = statusInt;
+            publishExecution(avgFillPrice, orderTickerId, static_cast<int>(orderId), statusInt,
+                             filled, remaining);
 
-            report.filled = filled;
-            report.remaining = remaining;
-
-            if (statusInt == 2 || statusInt == 3 || statusInt == 5) { // Filled, Cancelled, Inactive
-                risk_manager.registerOrderClosed(orderId);
-                // Terminal state: frees the entry so the map does not grow unbounded.
-                std::lock_guard<std::mutex> lock(order_map_mutex);
-                order_to_ticker.erase(orderId);
-            }
-
-            zmq::message_t msg(sizeof(ExecutionReport));
-            memcpy(msg.data(), &report, sizeof(ExecutionReport));
-            zmq_exec_pub.send(msg, zmq::send_flags::none);
-            
-            std::cout << "[EXECUTION] OrderID: " << orderId << " Status: " << status 
+            std::cout << "[EXECUTION] OrderID: " << orderId << " Status: " << status
                       << " (" << statusInt << ") Filled: " << filled << std::endl;
         }
 
@@ -823,27 +885,16 @@ class HFTEngine: public EWrapperL0 {
                 report.position = position;
                 report.avgCost = avgCost;
 
-                std::string topico = "POSITIONS";
-                zmq::message_t msg_topico(topico.size());
-                memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-                zmq::message_t msg_data(sizeof(PositionReport));
-                memcpy(msg_data.data(), &report, sizeof(PositionReport));
-
-                {
-                    std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                    zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                    zmq_pub.send(msg_data, zmq::send_flags::none);
-                }
+                publish("POSITIONS", &report, sizeof(report));
 
                 std::cout << "[RECON] Position received from IBKR: " << contract.symbol 
                           << " | Qtd: " << position << " | Price: " << avgCost << std::endl;
             }
         }
 
-        virtual void updatePortfolio(const Contract& contract, int position,
-                                     double marketPrice, double marketValue, double averageCost,
-                                     double unrealizedPNL, double realizedPNL, const IBString& accountName) override {
+        virtual void updatePortfolio(const Contract& contract, int /*position*/,
+                                     double /*marketPrice*/, double /*marketValue*/, double /*averageCost*/,
+                                     double unrealizedPNL, double realizedPNL, const IBString& /*accountName*/) override {
             int tickerId = -1;
             for (auto& kv : contract_map) {
                 if (sameContract(kv.second, contract)) {
@@ -879,160 +930,210 @@ class HFTEngine: public EWrapperL0 {
                 report.position = pos;
                 report.avgCost = 0.0;
 
-                std::string topico = "POSITIONS";
-                zmq::message_t msg_topico(topico.size());
-                memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-                zmq::message_t msg_data(sizeof(PositionReport));
-                memcpy(msg_data.data(), &report, sizeof(PositionReport));
-
-                {
-                    std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                    zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                    zmq_pub.send(msg_data, zmq::send_flags::none);
-                }
+                publish("POSITIONS", &report, sizeof(report));
             }
         }
 
-        // ===== ATOMIC SWAP LOGIC =====
-        // Called after each allocation on the hot path.
-        // If the active arena crossed the threshold, swap and wake the drain thread.
-        // GUARANTEE: the swap operation is a single atomic store — zero locks on the hot path.
+        // ===== RECORDING (hot path side) =====
+        // Copies one record into the ACTIVE arena. No disk I/O, no allocation, no
+        // lock: the only cost is a memcpy and a few atomics. Only the IBKR callback
+        // thread calls this, and only that thread flips `active_arena`, so the
+        // arena it writes to cannot be handed to the drain thread mid-copy.
+        void record(int tickerId, int32_t kind, const void* payload) {
+            if (op_mode == OperationMode::LISTEN_ONLY) return;
+            writers_in_record.fetch_add(1);  // seq_cst: pairs with the shutdown flush (Dekker-style)
+            if (recording_open.load()) {
+                const size_t n = recordPayloadSize(kind);
+                const int idx = active_arena.load(std::memory_order_relaxed);
+                char* p = static_cast<char*>(arenas[idx]->allocate(sizeof(RecordHeader) + n));
+                if (p) {
+                    const RecordHeader h{tickerId, kind};
+                    memcpy(p, &h, sizeof(h));
+                    memcpy(p + sizeof(h), payload, n);
+                } else {
+                    // Both arenas full: the disk cannot keep up. Drop the RECORD,
+                    // never the live message, and make the loss visible.
+                    if (dropped_records.fetch_add(1) % 10000 == 0) {
+                        std::cout << "[RECORDING WARN] Arena full, records dropped so far: "
+                                  << dropped_records.load() << std::endl;
+                    }
+                }
+                trySwapArena();
+            }
+            writers_in_record.fetch_sub(1);
+        }
+
+        // Called after each record. Flips the arenas when the active one is 90%
+        // full or SWAP_INTERVAL has passed with data in it — and only if the drain
+        // thread finished the previous cycle.
         void trySwapArena() {
-            int idx = active_arena.load(std::memory_order_relaxed);
+            const int idx = active_arena.load(std::memory_order_relaxed);
             ArenaAllocator* active = arenas[idx];
+            const size_t used = active->getUsedBytes();
+            if (used == 0) return;
 
-            size_t threshold_bytes = static_cast<size_t>(active->getCapacity() * SWAP_THRESHOLD);
-            if (active->getUsedBytes() < threshold_bytes) return;
+            const auto now = std::chrono::steady_clock::now();
+            const bool full = used >= static_cast<size_t>(active->getCapacity() * SWAP_THRESHOLD);
+            if (!full && now - last_swap < SWAP_INTERVAL) return;
 
-            // Only swap if the drain thread already finished the previous cycle
-            if (drain_pendente.load(std::memory_order_acquire)) {
-                // The reserve arena is still being drained — we cannot swap.
-                // In production this indicates back-pressure; log for diagnostics.
-                std::cout << "[PING-PONG WARN] Back-pressure: previous drain did not finish." << std::endl;
+            if (drain_pending.load(std::memory_order_acquire)) {
+                // The other arena is still being written to disk. Keep filling
+                // this one; warn once per episode, not once per tick.
+                if (full && !backpressure_warned.exchange(true)) {
+                    std::cout << "[PING-PONG WARN] Back-pressure: previous drain did not finish." << std::endl;
+                }
                 return;
             }
+            backpressure_warned = false;
 
-            int next_idx = 1 - idx; // 0 -> 1,  1 -> 0
-            active_arena.store(next_idx, std::memory_order_release); // <<< ATOMIC SWAP
-
-            // Signal the drain thread to process the arena that became inactive
+            active_arena.store(1 - idx, std::memory_order_release);
+            last_swap = now;
             {
                 std::lock_guard<std::mutex> lk(drain_mutex);
                 arena_to_drain = idx;
-                drain_pendente.store(true, std::memory_order_release);
+                drain_pending.store(true, std::memory_order_release);
             }
             drain_cv.notify_one();
+        }
 
-            std::cout << "[PING-PONG] Swap done: arena " << idx
-                      << " -> drain | arena " << next_idx << " -> active ("
-                      << active->getUsedBytes() << " bytes acumulados)" << std::endl;
+        // ===== RECORDING (drain side) =====
+        // Walks one arena record by record and appends each payload to its asset's
+        // file. Runs on the drain thread, or on the destructor's thread after the
+        // drain thread has been joined — never on two threads at once.
+        void writeArenaToDisk(ArenaAllocator* arena) {
+            const char* p = arena->getBuffer();
+            const char* end = p + arena->getUsedBytes();
+            while (p + sizeof(RecordHeader) <= end) {
+                RecordHeader h;
+                memcpy(&h, p, sizeof(h));
+                p += sizeof(h);
+                const size_t n = recordPayloadSize(h.kind);
+                if (p + n > end) break;   // cannot happen: allocate() is all-or-nothing
+
+                std::unordered_map<int, FILE*>* target =
+                    h.kind == REC_TRADE ? &file_map_trade :
+                    h.kind == REC_L2    ? &file_map : &file_map_l1;
+                auto it = target->find(h.tickerId);
+                if (it != target->end() && it->second) {
+                    fwrite(p, 1, n, it->second);
+                }
+                p += n;
+            }
+            for (auto* m : {&file_map, &file_map_l1, &file_map_trade}) {
+                for (auto& kv : *m) {
+                    if (kv.second) fflush(kv.second);
+                }
+            }
         }
 
         // ===== DRAIN THREAD (Background) =====
-        // Waits for a signal, writes the inactive arena's contents to disk (.bin)
-        // and calls resetar() to leave it clean for the next cycle.
         void drainLoop() {
-            while (engine_running.load(std::memory_order_relaxed)) {
+            while (true) {
                 std::unique_lock<std::mutex> lk(drain_mutex);
                 drain_cv.wait(lk, [this]{
-                    return drain_pendente.load(std::memory_order_acquire) 
+                    return drain_pending.load(std::memory_order_acquire)
                            || !engine_running.load(std::memory_order_relaxed);
                 });
-
-                if (!engine_running.load(std::memory_order_relaxed)) break;
-
-                int idx = arena_to_drain;
+                if (!drain_pending.load(std::memory_order_acquire)) break;  // shutdown, nothing to do
+                const int idx = arena_to_drain;
                 lk.unlock(); // Release the mutex before the heavy I/O
 
                 ArenaAllocator* arena = arenas[idx];
-                size_t bytes = arena->getUsedBytes();
+                writeArenaToDisk(arena);
+                arena->reset();
+                drain_pending.store(false, std::memory_order_release);
 
-                if (bytes > 0 && op_mode != OperationMode::LISTEN_ONLY) {
-                    // Write the arena's entire contiguous block into a dump file
-                    auto now = std::chrono::system_clock::now();
-                    auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now.time_since_epoch()
-                    ).count();
-
-                    std::string dump_filename = "data/arena_" + std::to_string(idx)
-                                          + "_" + std::to_string(epoch_ms) + ".bin";
-
-                    FILE* f = fopen(dump_filename.c_str(), "wb");
-                    if (f) {
-                        fwrite(arena->getBuffer(), 1, bytes, f);
-                        fclose(f);
-                        std::cout << "[DRAIN] Arena " << idx << " -> " << dump_filename
-                                  << " (" << bytes << " bytes)" << std::endl;
-                    } else {
-                        std::cout << "[DRAIN ERROR] Failed to open " << dump_filename << std::endl;
-                    }
-                }
-
-                // Clear the arena for reuse in the next cycle
-                arena->resetar();
-                drain_pendente.store(false, std::memory_order_release);
+                if (!engine_running.load(std::memory_order_relaxed)) break;
             }
         }
 
-        // ===== CALLBACKS — HOT PATH (lock-free) =====
+        // Shutdown: stop new records, wait for any callback still mid-copy, then
+        // write whatever is left — the arena waiting for the drain thread first
+        // (it is older), then the active one.
+        void flushRecordingOnShutdown() {
+            if (op_mode == OperationMode::LISTEN_ONLY) return;
+            recording_open.store(false);   // seq_cst, see record()
+            while (writers_in_record.load() != 0) {
+                std::this_thread::yield();
+            }
+            const int active = active_arena.load();
+            if (drain_pending.load()) {
+                writeArenaToDisk(arenas[1 - active]);
+                arenas[1 - active]->reset();
+                drain_pending = false;
+            }
+            writeArenaToDisk(arenas[active]);
+            arenas[active]->reset();
+            if (dropped_records.load() > 0) {
+                std::cout << "[RECORDING] " << dropped_records.load()
+                          << " record(s) were dropped because both arenas were full." << std::endl;
+            }
+        }
+
+        // ===== PUBLISHING =====
+        // Multipart [topic, payload] on 5555. The mutex serializes the callback
+        // paths that share zmq_pub; it is uncontended in practice (they all run on
+        // the IBKR callback thread) and is the only lock on the market-data path.
+        void publish(const std::string& topic, const void* data, size_t size) {
+            zmq::message_t msg_topic(topic.data(), topic.size());
+            zmq::message_t msg_data(data, size);
+            std::lock_guard<std::mutex> lock(zmq_pub_mutex);
+            zmq_pub.send(msg_topic, zmq::send_flags::sndmore);
+            zmq_pub.send(msg_data, zmq::send_flags::none);
+        }
+
+        static int64_t nowMicros() {
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+
+        // ===== CALLBACKS — HOT PATH =====
+        void onDepthUpdate(TickerId id, int position, int operation, int side, double price, int size) {
+            auto it_name = ticker_names.find(id);
+            if (it_name == ticker_names.end()) return;
+
+            L2Update update;
+            update.timestamp = nowMicros();
+            update.price = price;
+            update.position = position;
+            update.operation = operation;
+            update.side = side;
+            update.size = size;
+
+            record(static_cast<int>(id), REC_L2, &update);
+            publish(it_name->second + "_L2", &update, sizeof(update));
+        }
+
         virtual void updateMktDepth(TickerId id, int position, int operation, int side, double price, int size) override {
-            if (ticker_names.find(id) == ticker_names.end()) return;
-
-            L2Update update;
-            update.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()
-            ).count(); 
-            update.price = price;
-            update.position = position;
-            update.operation = operation;
-            update.side = side;
-            update.size = size;
-
-            std::string topico = ticker_names[id] + "_L2";
-            
-            zmq::message_t msg_topico(topico.size());
-            memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-            zmq::message_t msg_data(sizeof(L2Update));
-            memcpy(msg_data.data(), &update, sizeof(L2Update));
-
-            {
-                std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                zmq_pub.send(msg_data, zmq::send_flags::none);
-            }
+            onDepthUpdate(id, position, operation, side, price, size);
         }
 
-        virtual void updateMktDepthL2(TickerId id, int position, IBString marketMaker, int operation, int side, double price, int size) override {
-            if (ticker_names.find(id) == ticker_names.end()) return;
-
-            L2Update update;
-            update.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()
-            ).count(); 
-            update.price = price;
-            update.position = position;
-            update.operation = operation;
-            update.side = side;
-            update.size = size;
-
-            std::string topico = ticker_names[id] + "_L2";
-            
-            zmq::message_t msg_topico(topico.size());
-            memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-            zmq::message_t msg_data(sizeof(L2Update));
-            memcpy(msg_data.data(), &update, sizeof(L2Update));
-
-            {
-                std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                zmq_pub.send(msg_data, zmq::send_flags::none);
-            }
+        virtual void updateMktDepthL2(TickerId id, int position, IBString /*marketMaker*/, int operation, int side, double price, int size) override {
+            onDepthUpdate(id, position, operation, side, price, size);
         }
 
-        virtual void tickPrice(TickerId tickerId, TickType field, double price, int canAutoExecute) override {
+        // Top of book changed (bid/ask price or size): record + publish the side
+        // as a level-0 L2Update, but only once both its price and size are known.
+        void onTopOfBook(TickerId tickerId, bool is_bid) {
+            auto it_name = ticker_names.find(tickerId);
+            auto it_book = active_book_state.find(tickerId);
+            if (it_name == ticker_names.end() || it_book == active_book_state.end()) return;
+            const BookSide& side = is_bid ? it_book->second.bid : it_book->second.ask;
+            if (side.price <= 0.0 || side.size <= 0) return;
+
+            L2Update update;
+            update.timestamp = nowMicros();
+            update.price = side.price;
+            update.position = 0;              // Top of Book is level 0
+            update.operation = 1;             // 1 = Update
+            update.side = is_bid ? 1 : 0;     // 1 for Bid, 0 for Ask
+            update.size = side.size;
+
+            record(static_cast<int>(tickerId), REC_L1, &update);
+            publish(it_name->second + "_L2", &update, sizeof(update));
+        }
+
+        virtual void tickPrice(TickerId tickerId, TickType field, double price, int /*canAutoExecute*/) override {
             const DataMode mode = tickerMode(tickerId);
 
             // ── TRADE: LAST (4) and Delayed Last (68) ────────────────────
@@ -1049,73 +1150,23 @@ class HFTEngine: public EWrapperL0 {
                 auto it = trade_cache.find(tickerId);
                 if (it == trade_cache.end()) return;
                 it->second.last_price = price;
-                it->second.last_ts_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count();
+                it->second.last_ts_us = nowMicros();
                 return;
             }
 
-            // Filter Bid (1), Ask (2) and the Delayed versions (66, 67)
-            //
             // Pure TRADE mode does not publish book: the reqMktData that brings
             // the trades also brings bid/ask, and emitting `_L2` that no one
             // subscribed to would be just traffic. TICK_L1 keeps publishing,
             // which is the --L1 flag's behavior from the start.
             if (mode == DataMode::TRADE) return;
 
+            // Bid (1), Ask (2) and the Delayed versions (66, 67)
             if (field == 1 || field == 2 || field == 66 || field == 67) {
-                bool is_bid = (field == 1 || field == 66);
-                
-                // Update the in-memory state (cache)
-                if (is_bid) {
-                    active_book_state[tickerId].bid.price = price;
-                } else {
-                    active_book_state[tickerId].ask.price = price;
-                }
-
-                // Fetch the current size from cache. If zero, wait for the matching tickSize
-                int current_size = is_bid ? active_book_state[tickerId].bid.size : active_book_state[tickerId].ask.size;
-                if (current_size <= 0) return;
-
-                // Allocate on the ACTIVE arena (atomic read — lock-free)
-                int idx = active_arena.load(std::memory_order_relaxed);
-                L2Update* ptr_l2 = (L2Update*) arenas[idx]->alocar(sizeof(L2Update));
-                if (ptr_l2 == nullptr) return;
-
-                ptr_l2->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count();
-                
-                ptr_l2->price = price;
-                ptr_l2->position = 0; // Top of Book is level 0
-                ptr_l2->operation = 1; // 1 = Update
-                ptr_l2->side = is_bid ? 1 : 0; // 1 for Bid, 0 for Ask
-                ptr_l2->size = current_size; // Intact size from cache
-
-                // Conditional write (L1) -> uses file_map_l1 without depending on the L2 file_map
-                if (op_mode != OperationMode::LISTEN_ONLY) {
-                    auto it_l1 = file_map_l1.find(tickerId);
-                    if (it_l1 != file_map_l1.end() && it_l1->second) {
-                        fwrite(ptr_l2, sizeof(L2Update), 1, it_l1->second);
-                    }
-                }
-
-                std::string topico = ticker_names[tickerId] + "_L2";
-                
-                zmq::message_t msg_topico(topico.size());
-                memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-                zmq::message_t msg_data(sizeof(L2Update));
-                memcpy(msg_data.data(), ptr_l2, sizeof(L2Update));
-
-                {
-                    std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                    zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                    zmq_pub.send(msg_data, zmq::send_flags::none);
-                }
-
-                // Check whether to swap arenas
-                trySwapArena();
+                const bool is_bid = (field == 1 || field == 66);
+                auto it_book = active_book_state.find(tickerId);
+                if (it_book == active_book_state.end()) return;
+                (is_bid ? it_book->second.bid : it_book->second.ask).price = price;
+                onTopOfBook(tickerId, is_bid);
             }
         }
 
@@ -1134,7 +1185,7 @@ class HFTEngine: public EWrapperL0 {
 
                 auto it_cache = trade_cache.find(tickerId);
                 if (it_cache == trade_cache.end()) return;
-                double px = it_cache->second.last_price;
+                const double px = it_cache->second.last_price;
                 if (px <= 0.0) return;   // the matching LAST has not arrived yet
 
                 TradeUpdate ev{};
@@ -1146,97 +1197,28 @@ class HFTEngine: public EWrapperL0 {
                 // in the wrong bar. The aggregator closes the bar by the timestamp
                 // that comes from here, so the error would look like its fault when
                 // it isn't.
-                ev.timestamp_us = it_cache->second.last_ts_us;
-                if (ev.timestamp_us <= 0) {
-                    ev.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count();
-                }
+                ev.timestamp_us = it_cache->second.last_ts_us > 0 ? it_cache->second.last_ts_us : nowMicros();
                 ev.price = px;
                 ev.size = size;
                 ev.padding = 0;
 
-                if (op_mode != OperationMode::LISTEN_ONLY) {
-                    auto it_f = file_map_trade.find(tickerId);
-                    if (it_f != file_map_trade.end() && it_f->second) {
-                        fwrite(&ev, sizeof(TradeUpdate), 1, it_f->second);
-                    }
-                }
-
-                auto it_nome = ticker_names.find(tickerId);
-                if (it_nome == ticker_names.end()) return;
-                std::string topico = it_nome->second + "_TRADE";
-
-                zmq::message_t msg_topico(topico.size());
-                memcpy(msg_topico.data(), topico.c_str(), topico.size());
-                zmq::message_t msg_data(sizeof(TradeUpdate));
-                memcpy(msg_data.data(), &ev, sizeof(TradeUpdate));
-
-                {
-                    std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                    zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                    zmq_pub.send(msg_data, zmq::send_flags::none);
-                }
+                auto it_name = ticker_names.find(tickerId);
+                if (it_name == ticker_names.end()) return;
+                record(static_cast<int>(tickerId), REC_TRADE, &ev);
+                publish(it_name->second + "_TRADE", &ev, sizeof(ev));
                 return;
             }
 
             // See the note in tickPrice: pure TRADE mode does not publish book.
             if (mode == DataMode::TRADE) return;
 
-            // Filter Bid Size (0), Ask Size (3) and the Delayed versions (69, 70)
+            // Bid Size (0), Ask Size (3) and the Delayed versions (69, 70)
             if (field == 0 || field == 3 || field == 69 || field == 70) {
-                bool is_bid = (field == 0 || field == 69);
-                
-                // Update the in-memory state (cache)
-                if (is_bid) {
-                    active_book_state[tickerId].bid.size = size;
-                } else {
-                    active_book_state[tickerId].ask.size = size;
-                }
-
-                // Fetch the current price from cache. If <= 0, wait for the matching tickPrice
-                double current_price = is_bid ? active_book_state[tickerId].bid.price : active_book_state[tickerId].ask.price;
-                if (current_price <= 0.0) return;
-
-                // Allocate on the ACTIVE arena (atomic read — lock-free)
-                int idx = active_arena.load(std::memory_order_relaxed);
-                L2Update* ptr_l2 = (L2Update*) arenas[idx]->alocar(sizeof(L2Update));
-                if (ptr_l2 == nullptr) return;
-
-                ptr_l2->timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()
-                ).count();
-                
-                ptr_l2->price = current_price; // Intact price from cache
-                ptr_l2->position = 0; // Top of Book is level 0
-                ptr_l2->operation = 1; // 1 = Update
-                ptr_l2->side = is_bid ? 1 : 0; // 1 for Bid, 0 for Ask
-                ptr_l2->size = size; // The size received in the tick (also in cache)
-
-                // Conditional write (L1) -> uses file_map_l1 without depending on the L2 file_map
-                if (op_mode != OperationMode::LISTEN_ONLY) {
-                    auto it_l1 = file_map_l1.find(tickerId);
-                    if (it_l1 != file_map_l1.end() && it_l1->second) {
-                        fwrite(ptr_l2, sizeof(L2Update), 1, it_l1->second);
-                    }
-                }
-
-                std::string topico = ticker_names[tickerId] + "_L2";
-                
-                zmq::message_t msg_topico(topico.size());
-                memcpy(msg_topico.data(), topico.c_str(), topico.size());
-
-                zmq::message_t msg_data(sizeof(L2Update));
-                memcpy(msg_data.data(), ptr_l2, sizeof(L2Update));
-
-                {
-                    std::lock_guard<std::mutex> lock(zmq_pub_mutex);
-                    zmq_pub.send(msg_topico, zmq::send_flags::sndmore);
-                    zmq_pub.send(msg_data, zmq::send_flags::none);
-                }
-
-                // Check whether to swap arenas
-                trySwapArena();
+                const bool is_bid = (field == 0 || field == 69);
+                auto it_book = active_book_state.find(tickerId);
+                if (it_book == active_book_state.end()) return;
+                (is_bid ? it_book->second.bid : it_book->second.ask).size = size;
+                onTopOfBook(tickerId, is_bid);
             }
         }
 };

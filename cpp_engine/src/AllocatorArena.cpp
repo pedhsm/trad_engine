@@ -1,31 +1,21 @@
-#include "../include/AllocatorArena.h" // 1. Bring the header in here
+#include "../include/AllocatorArena.h"
 
-// The Constructor
-ArenaAllocator::ArenaAllocator(size_t tamanho_em_bytes) {
-    tamanho_total = tamanho_em_bytes;
-    offset_atual = 0; 
-    buffer_inicio = new char[tamanho_total];
-}
+ArenaAllocator::ArenaAllocator(size_t size_bytes)
+    : buffer_start(new char[size_bytes]), total_size(size_bytes), offset(0) {}
 
-// The Destructor
 ArenaAllocator::~ArenaAllocator() {
-    delete [] buffer_inicio;
+    delete[] buffer_start;
 }
 
-// The Allocate method (note the ::)
-void* ArenaAllocator::alocar(size_t bytes_necessarios) {
-    size_t limit = (tamanho_total - offset_atual);
-    if (limit >= bytes_necessarios) {
-        char* buffer_agora = offset_atual + buffer_inicio;
-        offset_atual = offset_atual + bytes_necessarios;
-        return buffer_agora;
-    }
-    else {
+void* ArenaAllocator::allocate(size_t bytes) {
+    if (total_size - offset < bytes) {
         return nullptr;
     }
+    char* p = buffer_start + offset;
+    offset += bytes;
+    return p;
 }
 
-// The Reset method
-void ArenaAllocator::resetar() {
-    offset_atual = 0;
+void ArenaAllocator::reset() {
+    offset = 0;
 }

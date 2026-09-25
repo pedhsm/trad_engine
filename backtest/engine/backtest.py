@@ -12,7 +12,6 @@ from backtest.engine.trade_metrics import analyse_model_performance, print_metri
 from backtest.validation.mcpt_runner import MCPTRunner, run_insample, run_walkforward
 from backtest.validation import hybrid_walkforward, pure_walkforward
 import pandas as pd
-import duckdb
 
 
 class DuckDBDataLoader:
@@ -20,6 +19,10 @@ class DuckDBDataLoader:
     
     @staticmethod
     def load_data(asset: str, interval: str = '1min', start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        try:
+            import duckdb  # optional dependency: only this loader needs it
+        except ImportError as e:
+            raise ImportError("DuckDBDataLoader needs duckdb: pip install duckdb") from e
         try:
             con = duckdb.connect()
             

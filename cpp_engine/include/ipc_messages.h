@@ -19,20 +19,36 @@
 // rejected explicitly in the check, instead of failing silently.
 #define IPC_PROTOCOL_VERSION 3
 
+// ExecutionReport.status. A strategy that keeps one order in flight per asset
+// unlocks on the TERMINAL ones (FILLED, CANCELLED, INACTIVE, REJECTED).
+enum ExecStatus : int {
+    EXEC_OTHER = 0,
+    EXEC_SUBMITTED = 1,
+    EXEC_FILLED = 2,          // also sent with orderId 0 when already at the target
+    EXEC_CANCELLED = 3,
+    EXEC_PRESUBMITTED = 4,
+    EXEC_INACTIVE = 5,
+    // The engine refused the target (risk limit, kill switch, order already in
+    // flight). orderId 0, remaining = the refused quantity. Without it a refused
+    // target is silence, and a strategy waiting for its order would wait forever.
+    EXEC_REJECTED = 6,
+    EXEC_BROKER_DISCONNECT = 9,
+};
+
 #pragma pack(push, 1)
 struct ExecutionReport {
-    uint8_t version;      // IPC v2
+    uint8_t version;      // IPC_PROTOCOL_VERSION
     uint8_t reserved[3];  // Explicit alignment
     double price;
     int tickerId;         // v2: which asset this report belongs to
     int orderId;
-    int status;
+    int status;           // ExecStatus
     int filled;
     int remaining;
 };
 
 struct PositionReport {
-    uint8_t version;      // IPC v2
+    uint8_t version;      // IPC_PROTOCOL_VERSION
     uint8_t reserved[3];  // Explicit alignment
     int tickerId;
     int position;
@@ -46,15 +62,16 @@ struct PositionReport {
 // no signal to send", and the engine would flatten the book in a merely stalled
 // market.
 struct StrategyHeartbeat {
-    uint8_t version;          // IPC v2
+    uint8_t version;          // IPC_PROTOCOL_VERSION
     uint8_t reserved[3];      // Explicit alignment
     uint32_t seq;             // sequential; a jump indicates a missed beat
     int64_t timestamp_unix_ms;// strategy clock, for diagnostics only
 };
 #pragma pack(pop)
 
-static_assert(sizeof(ExecutionReport) == 32, "ExecutionReport must be 32 bytes for IPC v2");
-static_assert(sizeof(PositionReport) == 20, "PositionReport must be 20 bytes for IPC");
-static_assert(sizeof(TargetPositionRequest) == 28, "TargetPositionRequest must be 28 bytes for IPC");
-static_assert(sizeof(StrategyHeartbeat) == 16, "StrategyHeartbeat must be 16 bytes for IPC v2");
-static_assert(sizeof(TradeUpdate) == 28, "TradeUpdate must be 28 bytes for IPC v3");
+static_assert(sizeof(ExecutionReport) == 32, "ExecutionReport must be 32 bytes");
+static_assert(sizeof(PositionReport) == 20, "PositionReport must be 20 bytes");
+static_assert(sizeof(TargetPositionRequest) == 28, "TargetPositionRequest must be 28 bytes");
+static_assert(sizeof(StrategyHeartbeat) == 16, "StrategyHeartbeat must be 16 bytes");
+static_assert(sizeof(TradeUpdate) == 28, "TradeUpdate must be 28 bytes");
+static_assert(sizeof(L2Update) == 32, "L2Update must be 32 bytes");

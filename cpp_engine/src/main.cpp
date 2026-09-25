@@ -190,6 +190,12 @@ int main(int argc, char* argv[]) {
                                                     risk_limits_cfg.max_concurrent_orders);
         risk_limits_cfg.watchdog_timeout_ms  = rp.value("watchdog_timeout_ms",
                                                     risk_limits_cfg.watchdog_timeout_ms);
+        risk_limits_cfg.day_reset_utc_hour   = rp.value("day_reset_utc_hour",
+                                                    risk_limits_cfg.day_reset_utc_hour);
+        if (risk_limits_cfg.day_reset_utc_hour < 0 || risk_limits_cfg.day_reset_utc_hour > 23) {
+            std::cout << "[FATAL] risk_params.day_reset_utc_hour must be 0..23." << std::endl;
+            return 1;
+        }
 
         if (risk_limits_cfg.max_daily_loss_usd <= 0 || risk_limits_cfg.max_lot_size <= 0
             || risk_limits_cfg.max_orders_per_day <= 0

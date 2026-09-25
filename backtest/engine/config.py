@@ -178,7 +178,10 @@ def print_config(config: MCPTConfig):
 class StrategyRegistry:
     """Registry for managing strategy name-to-implementation mappings."""
 
-    def __init__(self, registry_file: str = 'src/registry/strats.reg.json'):
+    def __init__(self, registry_file: Optional[str] = None):
+        # A JSON file of extra strategies (written by register_strategy). Optional:
+        # without it the built-in examples below are available.
+        registry_file = registry_file or os.environ.get('TRAD_ENGINE_REGISTRY', 'strategies.reg.json')
         self.registry_file = registry_file
         self.strategies: Dict[str, Dict[str, str]] = {}
         self.loaded_strategies: Dict[str, Type[TradingStrategy]] = {}
@@ -214,8 +217,18 @@ class StrategyRegistry:
             "example: donchian": {
                 "module": "backtest.strategies._legacy.donchian_strategy",
                 "class": "DonchianStrategy",
-                "description": "Donchian Breakout Strategy (example)"
-            }
+                "description": "Donchian breakout (example)"
+            },
+            "example: bollinger": {
+                "module": "backtest.strategies._legacy.bollinger_bands",
+                "class": "BollingerBands",
+                "description": "Bollinger bands mean reversion (example)"
+            },
+            "example: basis": {
+                "module": "backtest.strategies._legacy.ddm_v1",
+                "class": "DDMStrategy",
+                "description": "Spot/futures basis percentile model (example; needs spot/futures columns)"
+            },
         }
         # In-memory only: do not write a registry file at import time.
 
