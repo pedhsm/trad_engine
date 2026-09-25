@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# C++ build
+build/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+
+# IBKR TWS API (you supply it — never commit it, it is not redistributable)
+lib/client/*
+!lib/client/README.md
+
+# Data / secrets / local state
+*.db
+*.db.wal
+*.parquet
+*.csv
+.env
+*.log
+state.json
+journal*.db
+
+# IDE
+.vscode/
+.idea/

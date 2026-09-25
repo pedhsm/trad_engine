@@ -1,0 +1,12 @@
+# Core (required)
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# Optional
+# DuckDB-backed data loader in backtest/engine:
+duckdb>=0.9
+# Progress bars in the validation harness (degrades to a no-op if absent):
+tqdm>=4.0
+# Plotting in the validation harness (import is optional; only needed to draw):
+matplotlib>=3.5
