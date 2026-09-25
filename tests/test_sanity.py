@@ -180,6 +180,38 @@ def test_mcpt_is_blind_to_lookahead_so_pit_must_catch_it():
     assert ok, detail
 
 
+def test_row_mode_certifies_lookahead_as_an_edge():
+    # In 'row' mode the returns are pre-computed and travel with the shuffled rows,
+    # so a lookahead signal's advantage does NOT carry over to the permutations:
+    # the oracle gets the minimum p-value — MCPT stamps the leak as a great edge.
+    # 'bar' (and 'block') recompute returns from the permuted prices, so the leak
+    # helps the permutations as much as the real run and p stays unremarkable.
+    df = random_walk(800, seed=5)
+    row = MCPTTester(OracleStrategy()).run_insample_test(
+        df, n_permutations=40, perm_kwargs={"permutation_mode": "row"})
+    bar = MCPTTester(OracleStrategy()).run_insample_test(
+        df, n_permutations=40, perm_kwargs={"permutation_mode": "bar"})
+    assert row["p_value"] == pytest.approx(1 / 40)
+    assert bar["p_value"] > 0.5
+
+
+def test_block_bootstrap_cannot_see_edges_that_live_inside_its_blocks():
+    # A moving-block bootstrap keeps each block's internal order, i.e. it PRESERVES
+    # short-range dependence. Its null is "no edge beyond the local autocorrelation",
+    # so a strategy that lives off 1-bar momentum keeps its edge on the resampled
+    # series and looks ordinary. Power study (30 seeds, AR(1) phi=0.1, alpha 0.05):
+    # bar 87%, block1 87%, block2 20%, block3 3%, block5 0%, block10 0%.
+    df = momentum_market(1000, phi=0.1, seed=1000)
+    p = {}
+    for mode, bl in (("bar", None), ("block", 1), ("block", 10)):
+        kw = {"permutation_mode": mode, **({"block_length": bl} if bl else {})}
+        p[(mode, bl)] = MCPTTester(MomentumStrategy()).run_insample_test(
+            df, n_permutations=50, perm_kwargs=kw)["p_value"]
+    assert p[("bar", None)] <= 0.05, p
+    assert p[("block", 1)] <= 0.05, p      # block of 1 bar = plain bootstrap: sees it
+    assert p[("block", 10)] > 0.2, p       # the default block of 10 bars: blind
+
+
 # --- 3. research -> live parity -----------------------------------------------------
 
 def test_live_example_decides_exactly_like_the_backtest_primitive():

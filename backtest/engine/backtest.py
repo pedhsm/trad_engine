@@ -315,10 +315,13 @@ class InteractiveRunner:
             'help': 'Number of random permutations for MCPT'
         },
         'permutation_mode': {
-            'prompt': 'Enter permutation mode (bar/row/ar1)',
+            'prompt': 'Enter permutation mode (bar/row/block/ar1)',
             'required': False,
             'default': 'bar',
-            'help': 'bar: conservative (default), row: preserves correlations, ar1: preserves autocorrelation (most conservative for mean reversion)'
+            'help': ('bar (default): null = no temporal structure; row: keeps columns together, '
+                     'but certifies lookahead leaks as edge; block: keeps short-range dependence, '
+                     'so it cannot see short-horizon edges; ar1: basis strategies. '
+                     'See backtest/validation/bar_permute.py.')
         },
         'position_threshold': {
             'prompt': 'Enter position threshold',
@@ -660,10 +663,15 @@ def run_cli_mode():
 
     parser.add_argument('--permutation-mode', type=str, default='bar',
                        choices=['bar', 'row', 'ar1', 'block'],
-                       help='MCPT permutation mode: bar (conservative, default), row (preserves correlations), ar1 (preserves autocorrelation), or block (moving-block bootstrap, gold standard for autocorrelated data)')
+                       help='MCPT null hypothesis. bar (default): no temporal structure at all. row: keeps each '
+                            'row columns together, but certifies lookahead leaks as edge (use only on '
+                            'PIT-checked features). block: moving-block bootstrap, keeps dependence '
+                            'shorter than --block-length, so edges at that horizon are invisible. '
+                            'ar1: basis strategies (spot/futures). Details: backtest/validation/bar_permute.py')
 
     parser.add_argument('--block-length', type=int, default=None,
-                       help='Block length for block bootstrap (default: 10 bars for daily data, optimal by n^(1/3) rule). Range: 5-20 bars recommended.')
+                       help='Block length for --permutation-mode block (default 10). Must be shorter than the '
+                            'horizon the strategy exploits: an edge that fits inside a block is invisible.')
 
     args = parser.parse_args()
 

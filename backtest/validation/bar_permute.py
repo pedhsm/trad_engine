@@ -21,20 +21,35 @@ def get_permutation(
             - 'permute': Apply same permutation to extra columns (default, prevents leakage)
             - 'preserve': Keep original values (old behaviour, causes data leakage)
             - 'sync_close': Synchronise with permuted close prices (for futures column)
-        permutation_mode: Type of permutation to apply
-            - 'bar': Bar permutation (permutes OHLC relative movements independently) [DEFAULT]
-              More conservative, destroys both temporal and correlation structure
-            - 'row': Row-wise permutation (shuffles entire rows, preserves column correlations)
-              Best for strategies with derived features (spreads, basis, ratios)
-            - 'ar1': AR(1) permutation for basis-based strategies (generates synthetic basis using AR(1) model)
-              Most conservative test for mean reversion strategies, preserves autocorrelation structure
-              Requires 'spot' and 'futures' columns
-            - 'block': Moving-block bootstrap (preserves short-range temporal dependence)
-              Gold standard for autocorrelated data, preserves clustering and local structure
-              Most appropriate for non-stationary mean-reverting strategies
-              Requires 'spot' and 'futures' columns for basis strategies
-        block_length: Block length for block bootstrap (only used if permutation_mode='block')
-            If None, automatically calculated as 3 bars (suitable for 1-2 bar mean reversion)
+        permutation_mode: Type of permutation to apply. Each mode is a DIFFERENT null
+            hypothesis — pick the one that matches the question, not the "strictest".
+            Numbers below: rate of p <= 0.05 over 30 seeds, 1-bar momentum strategy
+            (tests/test_sanity.py documents each behaviour).
+            - 'bar' [DEFAULT]: shuffles the bars' relative moves (open vs previous close,
+              high/low/close vs open). Null: "no temporal structure at all". Detects
+              short-range edges (AR(1) phi=0.1 momentum: 87%), false positives on noise
+              ~3%. Returns are recomputed from the permuted prices, so a lookahead leak
+              helps the permutations as much as the real run: it does NOT create a
+              false positive (3%) — but it is not flagged either (inflated PnL + high p
+              is the signature to watch for; use pit_invariants to actually catch it).
+            - 'row': shuffles whole rows, keeping each row's columns together (useful
+              when the signal is a cross-column relation, e.g. a spread). WARNING: the
+              returns are pre-computed and travel with the rows, so a lookahead leak
+              does NOT carry over to the permutations and is certified as an edge
+              (10% leak, no real edge: 67% "significant"). Only use it on features that
+              passed the point-in-time checks.
+            - 'block': moving-block bootstrap of the returns. It PRESERVES dependence
+              shorter than the block, so its null is "no edge beyond the short-range
+              autocorrelation": it cannot see an edge that lives inside a block (1-bar
+              momentum: block 1 -> 87%, 2 -> 20%, 3 -> 3%, 5 and 10 -> 0%). Right when the
+              question is "is there edge beyond local clustering?"; wrong for testing a
+              short-horizon momentum / mean-reversion signal. Very conservative on noise.
+            - 'ar1': for basis strategies (needs 'spot' and 'futures'): simulates the
+              basis as an AR(1) fitted on the training part. Like 'block', it keeps the
+              autocorrelation in the null, so a basis mean-reversion edge that IS that
+              autocorrelation is not what it tests. (Not covered by the study above.)
+        block_length: Block length for 'block'. Default 10 bars. Must be SHORTER than the
+            horizon your strategy exploits, or the edge is inside the blocks and invisible.
 
     Returns:
         Permuted OHLC data in same format as input
@@ -162,9 +177,10 @@ def get_permutation(
 
             # Determine block length
             if block_length is None:
-                # Default: 10 bars for daily data (~2 weeks, optimal by n^(1/3) rule)
-                # Balances preserving autocorrelation vs having enough independent blocks
-                # For 1256 bars: 10^3 = 1000, close to n=1256
+                # Default: 10 bars (the n^(1/3) rule of thumb for ~1000 bars). It
+                # decides what the test can see: any edge whose horizon fits inside
+                # a block is preserved in the null and becomes invisible (see the
+                # docstring and tests/test_sanity.py).
                 b_len = 10
             else:
                 b_len = max(1, int(block_length))
