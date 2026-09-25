@@ -1,0 +1,4 @@
+pytest>=7.0
+# Only used to check that the frozen meta_model reproduces sklearn exactly
+# (the test is skipped if it is absent; the engine itself never imports sklearn).
+scikit-learn>=1.3

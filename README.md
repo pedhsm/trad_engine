@@ -8,7 +8,8 @@ validation harness** (Monte Carlo permutation tests, walk-forward, point-in-time
 invariants) so the numbers you get out are ones you can actually trust.
 
 > **What this is not.** This is engine + method. It ships with *example* strategies
-> (textbook moving-average / RSI / Donchian, and a microstructure template). It does
+> (textbook Donchian breakout, Bollinger bands, a spot/futures basis model, and a
+> microstructure template). It does
 > **not** ship anyone's alpha — bring your own signal; the engine is agnostic to it.
 
 ---
@@ -20,9 +21,11 @@ worth reading even if you never run it:
 
 1. **A Python reference and a C++ mirror, locked by parity tests.**
    `core_math` exists twice: a readable Python implementation (the ground truth) and a
-   fast C++ implementation (the hot path). A parity test asserts they produce the same
-   numbers, bit for bit. You get C++ speed in production without giving up a
-   researchable, debuggable reference — and you can never silently drift the two apart.
+   fast C++ implementation (the hot path). A parity test (`tests/test_cpp_parity.py`)
+   compiles the mirror and asserts it matches the reference to within 1e-12 — not
+   bit for bit, because pandas and the C++ loops sum in a different order, but ~1000x
+   tighter than any real formula drift. You get C++ speed in production without giving
+   up a researchable, debuggable reference, and the two cannot silently drift apart.
 
 2. **Models frozen as data, not as pickles.**
    A trained linear/logistic classifier is frozen into ~30 plain floats (coefficients,
@@ -34,8 +37,10 @@ worth reading even if you never run it:
 
 3. **Causality is a first-class invariant, not a hope.**
    Every primitive documents that the value at time *t* uses only data at or before *t*.
-   The validation layer includes point-in-time invariant checks so lookahead leakage
-   fails loudly in CI instead of quietly inflating a backtest.
+   The validation layer includes point-in-time invariant checks, and CI runs them
+   against every primitive (`tests/test_causality.py`): perturb the future, and nothing
+   at or before *t* may change. The checkers are themselves tested against planted
+   leaks, so lookahead fails loudly instead of quietly inflating a backtest.
 
 ---
 
@@ -57,8 +62,10 @@ trad_engine/
 │   ├── engine/          # the backtest loop + trade metrics
 │   ├── validation/      # MCPT, walk-forward, bar-permutation, PIT invariants
 │   └── strategies/      # example strategies (bring your own for real use)
+├── live/                # trades -> bars (the shared glue of backtest and live loop)
 ├── examples/            # runnable end-to-end paper-trading demo
-└── benchmark/           # reproducible latency / throughput numbers
+├── benchmark/           # reproducible latency / throughput numbers
+└── tests/               # parity, causality, bar rules, validation mechanics
 ```
 
 ## Requirements
@@ -84,8 +91,12 @@ pip install -r requirements.txt
 # → simulated fills → journal), no broker or market data account needed:
 python -m examples.paper_demo
 
-# validate a strategy the honest way (Monte Carlo permutation test):
-python -m backtest.validation.mcpt_runner --help
+# validate a strategy the honest way (Monte Carlo permutation test, walk-forward):
+python -m backtest.engine.backtest --help
+
+# run the test suite (the C++ parity tests need g++/clang++ on PATH, else they skip):
+pip install -r requirements-dev.txt
+python -m pytest
 ```
 
 ## License
