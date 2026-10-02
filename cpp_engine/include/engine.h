@@ -215,6 +215,24 @@ class TradingEngine: public EWrapperL0 {
         std::deque<int> closed_orders_fifo;
         static constexpr size_t CLOSED_ORDERS_KEPT = 1024;
 
+        // Assets whose position the engine can no longer compute (same mutex). The
+        // per-order formula (pos_at_send + direction * filled) is exact only while one
+        // order at a time works an asset; a change after a terminal status is the one
+        // way two can overlap, and then each writes an absolute position from its own
+        // stale snapshot. Such an asset stops trusting the formula and refuses targets;
+        // once nothing works it any more, a fresh broker snapshot is requested and its
+        // position adopted (0 if the snapshot does not list it).
+        std::unordered_set<int> resync_tickers;
+        std::unordered_set<int> resync_seen;   // listed in the snapshot in progress
+        std::atomic<bool> resync_snapshot_pending{false};
+
+        bool hasWorkingOrderLocked(int tickerId) const {   // caller holds order_map_mutex
+            for (const auto& kv : order_info) {
+                if (kv.second.tickerId == tickerId) return true;
+            }
+            return false;
+        }
+
         zmq::context_t zmq_ctx;
         zmq::socket_t zmq_pub;
         zmq::socket_t zmq_pull;
@@ -433,6 +451,26 @@ class TradingEngine: public EWrapperL0 {
             }
         }
 
+        // Fresh snapshot for the assets in resync: re-subscribing makes IB resend every
+        // position, then positionEnd() adopts them.
+        void refreshPositions() {
+            {
+                std::lock_guard<std::mutex> lock(order_map_mutex);
+                resync_seen.clear();
+            }
+            resync_snapshot_pending = true;
+            std::cout << "[RESYNC] Requesting a fresh position snapshot from IBKR." << std::endl;
+            if (ptr_begin) {
+                ptr_begin->cancelPositions();
+                ptr_begin->reqPositions();
+            }
+        }
+
+        bool needsResync(int tickerId) {
+            std::lock_guard<std::mutex> lock(order_map_mutex);
+            return resync_tickers.count(tickerId) > 0;
+        }
+
         // One ExecutionReport on 5557. Called from the orders thread AND the IBKR
         // callback thread, hence the mutex: a zmq socket is not thread-safe.
         void publishExecution(double price, int tickerId, int orderId, int status,
@@ -506,6 +544,17 @@ class TradingEngine: public EWrapperL0 {
                     continue;
                 }
                 const int current_pos = it_pos->second.load();
+
+                // The engine lost track of this asset's position (two orders
+                // overlapped) and is waiting for the broker's snapshot.
+                if (needsResync(req.tickerId)) {
+                    std::cout << "[RISK REJECT] Ticker " << req.tickerId
+                              << ": position resync with IBKR pending. Target " << req.target_position
+                              << " refused." << std::endl;
+                    publishExecution(req.price, req.tickerId, 0, EXEC_REJECTED, 0,
+                                     std::abs(req.target_position - current_pos));
+                    continue;
+                }
 
                 // One order per asset at a time. The position only reflects a fill
                 // once the broker reports it; a second target computed before that
@@ -827,6 +876,7 @@ class TradingEngine: public EWrapperL0 {
             int prev_status = EXEC_OTHER;
             bool after_terminal = false;   // a change to an order already reported closed
             bool reopened = false;         // ...that is working again (not terminal)
+            bool need_snapshot = false;    // asset in resync and nothing works it any more
             {
                 std::lock_guard<std::mutex> lock(order_map_mutex);
                 OrderInfo info{};
@@ -873,17 +923,22 @@ class TradingEngine: public EWrapperL0 {
 
                 if (known) {
                     orderTickerId = info.tickerId;
-                    if (filled > 0) {
+                    if (after_terminal) resync_tickers.insert(info.tickerId);
+                    const bool resync = resync_tickers.count(info.tickerId) > 0;
+                    if (filled > 0 && !resync) {
                         // `filled` is cumulative, and the result is absolute: the
                         // same value whether or not the broker's position() update
-                        // for this fill already arrived.
+                        // for this fill already arrived. Exact only with one order at
+                        // a time on the asset, hence not during a resync.
                         auto it_pos = current_positions.find(info.tickerId);
                         if (it_pos != current_positions.end()) {
                             it_pos->second.store(info.pos_at_send + info.direction * filled);
                         }
                     }
+                    need_snapshot = resync && !hasWorkingOrderLocked(info.tickerId);
                 }
             }
+            if (need_snapshot) refreshPositions();
 
             if (after_terminal) {
                 std::cerr << "[EXECUTION] WARNING: orderId " << orderId
@@ -945,7 +1000,11 @@ class TradingEngine: public EWrapperL0 {
                     return;
                 }
                 it_cp->second.store(position);
-                
+                {
+                    std::lock_guard<std::mutex> lock(order_map_mutex);
+                    if (resync_tickers.count(tickerId)) resync_seen.insert(tickerId);
+                }
+
                 PositionReport report;
                 report.version = IPC_PROTOCOL_VERSION;
                 memset(report.reserved, 0, sizeof(report.reserved));
@@ -987,6 +1046,24 @@ class TradingEngine: public EWrapperL0 {
 
         virtual void positionEnd() override {
             std::cout << "[RECON] Position sync with IBKR complete." << std::endl;
+            if (resync_snapshot_pending.exchange(false)) {
+                std::lock_guard<std::mutex> lock(order_map_mutex);
+                for (auto it = resync_tickers.begin(); it != resync_tickers.end(); ) {
+                    const int t = *it;
+                    // An order that started working again during the snapshot: wait
+                    // for it to close (its terminal status asks for a new snapshot).
+                    if (hasWorkingOrderLocked(t)) { ++it; continue; }
+                    auto it_pos = current_positions.find(t);
+                    if (it_pos != current_positions.end()) {
+                        // Not listed = no position at the broker.
+                        if (!resync_seen.count(t)) it_pos->second.store(0);
+                        std::cout << "[RESYNC] Ticker " << t << ": adopted the broker's position "
+                                  << it_pos->second.load() << "; targets accepted again." << std::endl;
+                    }
+                    it = resync_tickers.erase(it);
+                }
+                resync_seen.clear();
+            }
             for (auto& kv : current_positions) {
                 int tickerId = kv.first;
                 int pos = kv.second.load();

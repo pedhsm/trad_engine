@@ -201,6 +201,12 @@ static void testOrders() {
     engine.orderStatus(1001, "Filled", 1, 0, 100.5, 0, 0, 100.5, 0, "");
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1001 && r.filled == 1);
+    // A change after a terminal status puts the asset in resync: no target until the
+    // broker's snapshot (requested right away, nothing else works the asset) arrives.
+    push.send(targetMsg(1, 0), zmq::send_flags::none);
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_REJECTED && r.tickerId == 1);
+    engine.positionEnd();                                       // snapshot lists nothing: flat
     push.send(targetMsg(1, 0), zmq::send_flags::none);          // already at 0 -> sync fill
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.orderId == 0 && r.tickerId == 1);
@@ -221,6 +227,39 @@ static void testOrders() {
     engine.orderStatus(1002, "Filled", 1, 0, 101.0, 0, 0, 101.0, 0, "");
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1002 && r.filled == 1);
+    engine.position("DU0000000", stock("ES"), 1, 101.0);        // the revival put it in resync
+    engine.positionEnd();
+
+    // Two orders overlapping on one asset. Only possible through a change after a
+    // terminal status, and there the per-order formula (pos_at_send + dir * filled)
+    // is wrong: each order writes an absolute position from its own snapshot.
+    // Position +1. Order 1003 sells 1, is cancelled unfilled; the asset unlocks and
+    // order 1004 sells 1 from +1; then 1003's fill arrives late. True position: -1.
+    push.send(targetMsg(1, 0), zmq::send_flags::none);          // +1 -> 0, id 1003
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    engine.orderStatus(1003, "Cancelled", 0, 1, 0.0, 0, 0, 0.0, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_CANCELLED && r.orderId == 1003);
+    push.send(targetMsg(1, 0), zmq::send_flags::none);          // +1 -> 0 again, id 1004
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    engine.orderStatus(1003, "Filled", 1, 0, 100.0, 0, 0, 100.0, 0, "");   // late
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1003);
+    // The engine no longer trusts its own arithmetic for this asset: targets are
+    // refused until the broker's position is known again.
+    engine.orderStatus(1004, "Filled", 1, 0, 100.0, 0, 0, 100.0, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.orderId == 1004);
+    push.send(targetMsg(1, -1), zmq::send_flags::none);
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_REJECTED && r.tickerId == 1 && r.orderId == 0);
+    // The broker's snapshot arrives (the engine asked for it once 1004 closed).
+    engine.position("DU0000000", stock("ES"), -1, 100.0);
+    engine.positionEnd();
+    // -1 is adopted (the formula would have said 0): target -1 is already reached.
+    push.send(targetMsg(1, -1), zmq::send_flags::none);
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.orderId == 0 && r.tickerId == 1);
 
     push.close();
     sub.close();
