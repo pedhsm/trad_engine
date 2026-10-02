@@ -221,7 +221,7 @@ class TradingEngine: public EWrapperL0 {
         // way two can overlap, and then each writes an absolute position from its own
         // stale snapshot. Such an asset stops trusting the formula and refuses targets;
         // once nothing works it any more, a fresh broker snapshot is requested and its
-        // position adopted (0 if the snapshot does not list it).
+        // position adopted. An asset the snapshot does not list stays blocked.
         std::unordered_set<int> resync_tickers;
         std::unordered_set<int> resync_seen;   // listed in the snapshot in progress
         std::atomic<bool> resync_snapshot_pending{false};
@@ -1053,10 +1053,19 @@ class TradingEngine: public EWrapperL0 {
                     // An order that started working again during the snapshot: wait
                     // for it to close (its terminal status asks for a new snapshot).
                     if (hasWorkingOrderLocked(t)) { ++it; continue; }
+                    // Not listed is NOT read as flat: it is also what a contract that
+                    // fails to match (sameContract compares strings, e.g. expiry 202612
+                    // vs 20261218) looks like. Stay blocked and say so; failing closed
+                    // costs a restart, failing open trades from a false "flat".
+                    if (!resync_seen.count(t)) {
+                        std::cerr << "[RESYNC] WARNING: ticker " << t << " is not in the broker's"
+                                  << " snapshot (flat, or its contract did not match). Targets stay"
+                                  << " REFUSED; check the position in TWS and restart the engine." << std::endl;
+                        ++it;
+                        continue;
+                    }
                     auto it_pos = current_positions.find(t);
                     if (it_pos != current_positions.end()) {
-                        // Not listed = no position at the broker.
-                        if (!resync_seen.count(t)) it_pos->second.store(0);
                         std::cout << "[RESYNC] Ticker " << t << ": adopted the broker's position "
                                   << it_pos->second.load() << "; targets accepted again." << std::endl;
                     }

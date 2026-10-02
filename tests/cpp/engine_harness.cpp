@@ -206,7 +206,16 @@ static void testOrders() {
     push.send(targetMsg(1, 0), zmq::send_flags::none);
     r = nextReport(sub);
     CHECK(r.status == EXEC_REJECTED && r.tickerId == 1);
-    engine.positionEnd();                                       // snapshot lists nothing: flat
+    // A snapshot that does not list the asset is NOT read as flat (a contract that
+    // fails to match looks the same): still refused.
+    engine.positionEnd();
+    push.send(targetMsg(1, 0), zmq::send_flags::none);
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_REJECTED && r.tickerId == 1);
+    // The next snapshot lists it at 0: adopted.
+    engine.refreshPositions();
+    engine.position("DU0000000", stock("ES"), 0, 0.0);
+    engine.positionEnd();
     push.send(targetMsg(1, 0), zmq::send_flags::none);          // already at 0 -> sync fill
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.orderId == 0 && r.tickerId == 1);
