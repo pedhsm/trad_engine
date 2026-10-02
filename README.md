@@ -14,6 +14,48 @@ invariants) so the numbers you get out are ones you can actually trust.
 
 ---
 
+## How it fits together
+
+```mermaid
+flowchart TD
+    classDef cpp fill:#2b3440,stroke:#5c6d82,stroke-width:2px,color:#fff;
+    classDef python fill:#34495e,stroke:#f1c40f,stroke-width:2px,color:#fff;
+    classDef ibkr fill:#c0392b,stroke:#e74c3c,stroke-width:2px,color:#fff;
+    classDef data fill:#2980b9,stroke:#3498db,stroke-width:2px,color:#fff;
+
+    IBKR[IB Gateway / TWS]:::ibkr
+
+    subgraph LIVE ["Live path — two processes on localhost"]
+        ENGINE["C++ engine (cpp_engine)<br/>risk gate · watchdog · recorder"]:::cpp
+        STRAT["Python strategy<br/>live/ipc.py + live/bar_aggregator.py"]:::python
+    end
+
+    subgraph RESEARCH ["Research path"]
+        DATA[("Parquet bars<br/>(local or S3 via DuckDB)")]:::data
+        BT["Backtest loop<br/>backtest/engine"]:::python
+        VAL["Validation<br/>MCPT · walk-forward · PIT invariants"]:::python
+    end
+
+    MATH["core_math<br/>Python reference + C++ mirror<br/>(parity-tested to 1e-12)"]:::python
+
+    IBKR -- "market data, fills<br/>(API port 4002)" --> ENGINE
+    ENGINE -- "orders" --> IBKR
+    ENGINE -- "ZeroMQ PUB<br/>:5555 ticks<br/>:5557 executions<br/>:5558 engine heartbeat" --> STRAT
+    STRAT -- "ZeroMQ<br/>:5556 target positions<br/>:5559 strategy heartbeat<br/>(silent 5 s → flatten & halt)" --> ENGINE
+    REC[("raw tick .bin files<br/>(--mode record_local)")]:::data
+    ENGINE -.-> REC
+
+    DATA --> BT --> VAL
+    MATH --> STRAT
+    MATH --> BT
+```
+
+The same `core_math` feeds the backtest and the live strategy, so a signal is computed
+by one piece of code in both places. The strategy only ever says *what position it
+wants*; the engine owns the broker connection and decides whether that is allowed.
+
+---
+
 ## Why it might be worth your time
 
 Three design decisions do most of the work here, and they are the reason the code is
@@ -109,6 +151,8 @@ format, checked field-by-field against the C++ structs in CI (`tests/test_ipc.py
 ```bash
 # 1. build the engine (needs lib/client populated, ZeroMQ, CMake)
 cmake -S cpp_engine -B build && cmake --build build
+#    Windows: tested with MSYS2 UCRT64 (pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,zeromq})
+#    and `cmake -S cpp_engine -B build -G Ninja`
 
 # 2. start IB Gateway (paper account, API on port 4002), then the engine
 ./build/trad_engine --live --mode listen_only --config examples/engine_config.example.json
