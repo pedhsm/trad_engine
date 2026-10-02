@@ -33,7 +33,7 @@ def apply_triple_barrier(
 
     Returns: event_ts (the raw event timestamp, before it is snapped to the entry
     quote), t_start (real entry timestamp), bet_direction, label (+1 profit /
-    -1 stop / 0 timeout), t_end, ret_realizado.
+    -1 stop / 0 timeout), t_end, realized_ret.
     """
     mid = mid.sort_index()
     rows = []
@@ -88,11 +88,11 @@ def apply_triple_barrier(
         else:
             t_end, label, exit_price = window.index[-1], 0, window.iloc[-1]
 
-        ret_realizado = float(np.log(exit_price / entry_price))
+        realized_ret = float(np.log(exit_price / entry_price))
         rows.append({
             "event_ts": ts, "t_start": entry_ts, "bet_direction": d, "label": label,
-            "t_end": t_end, "ret_realizado": ret_realizado,
+            "t_end": t_end, "realized_ret": realized_ret,
         })
 
     return pd.DataFrame(rows, columns=["event_ts", "t_start", "bet_direction", "label",
-                                       "t_end", "ret_realizado"])
+                                       "t_end", "realized_ret"])

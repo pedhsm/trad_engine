@@ -1,4 +1,4 @@
-# core_math/calculos_l2.py
+# core_math/l2_math.py
 
 def book_imbalance_signal(bids, asks, trigger_threshold=0.6):
     """

@@ -2,13 +2,11 @@
 
 [English](README.md) · **Português**
 
-Um engine de trading algorítmico ponta a ponta, self-hosted, para você usar como
-**base** e montar uma mesa em cima — nem brinquedo, nem framework inchado. Um núcleo
-C++ de baixa latência para market data e execução, uma camada `core_math` em Python
-puro que o espelha sob testes de paridade, um engine de backtest e — a parte que a
-maioria dos engines abertos pula — um **arcabouço de validação sério** (testes de
-permutação de Monte Carlo, walk-forward, invariantes point-in-time), para que os
-números que saem dele sejam números em que dá para confiar.
+Um engine de trading algorítmico self-hosted: um núcleo C++ de market data e execução
+conectado à Interactive Brokers, uma camada `core_math` em Python puro que o espelha
+sob testes de paridade, um engine de backtest e um **arcabouço de validação** (testes
+de permutação de Monte Carlo, walk-forward, invariantes point-in-time) feito para pegar
+os jeitos como um backtest mente.
 
 Medido, não prometido: o caminho quente em C++ adiciona **0,3 µs** por tick (p50), e
 uma ida e volta completa engine -> estratégia Python -> engine leva **273 µs** (p50)

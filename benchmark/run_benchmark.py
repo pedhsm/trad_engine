@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from core_math import bars_math, calculos_l2, micro_math
+from core_math import bars_math, l2_math, micro_math
 
 
 def make_bars(n: int, seed: int = 0) -> pd.DataFrame:
@@ -111,8 +111,8 @@ def main() -> None:
     # book_imbalance is O(depth), not O(bars); time N calls to get a comparable rate.
     def book_loop():
         for _ in range(n):
-            calculos_l2.book_imbalance_signal(book_bids, book_asks)
-    print(_row("calculos_l2.imbalance (xN)", _time(book_loop, args.repeat), n))
+            l2_math.book_imbalance_signal(book_bids, book_asks)
+    print(_row("l2_math.imbalance (xN)", _time(book_loop, args.repeat), n))
 
     print("-" * 72)
     lib = try_load_cpp()

@@ -10,6 +10,6 @@ data timestamped at or before t, never the future.
 """
 from __future__ import annotations
 
-from . import bars_math, calculos_l2, labeling, meta_model, micro_math
+from . import bars_math, l2_math, labeling, meta_model, micro_math
 
-__all__ = ["bars_math", "calculos_l2", "labeling", "meta_model", "micro_math"]
+__all__ = ["bars_math", "l2_math", "labeling", "meta_model", "micro_math"]

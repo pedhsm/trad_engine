@@ -2,7 +2,7 @@
 #define TRAD_ENGINE_CORE_MATH_CPP_MICRO_H
 
 // core_math — C++ mirror of the microstructure primitives in core_math
-// (micro_math.py, calculos_l2.py).
+// (micro_math.py, l2_math.py).
 //
 // The Python module is the REFERENCE. This is the deterministic, GC-free mirror
 // for the live tick hot path, and it is kept in lockstep with the reference by
@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 // Weighted order-book imbalance — numeric core of
-// calculos_l2.book_imbalance_signal. Each depth level weighted 1/(idx+1).
+// l2_math.book_imbalance_signal. Each depth level weighted 1/(idx+1).
 // Returns buy/(buy+sell) in [0,1], or -1.0 when total weighted volume is zero.
 double book_imbalance(const double* bid_vols, int n_bids,
                       const double* ask_vols, int n_asks);

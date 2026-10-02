@@ -30,7 +30,7 @@ def test_quote_after_vertical_barrier_is_ignored():
     out = _label([(0, 100.0), (7, 102.0)])
     assert out.label.iloc[0] == 0
     assert out.t_end.iloc[0] == _m(0)
-    assert out.ret_realizado.iloc[0] == 0.0
+    assert out.realized_ret.iloc[0] == 0.0
 
 
 def test_hit_exactly_at_vertical_barrier_counts():
@@ -42,7 +42,7 @@ def test_timeout_inside_horizon():
     out = _label([(0, 100.0), (2, 100.3), (4, 100.2), (9, 100.0)])
     assert out.label.iloc[0] == 0
     assert out.t_end.iloc[0] == _m(4)
-    assert out.ret_realizado.iloc[0] == pytest.approx(0.001998, rel=1e-3)
+    assert out.realized_ret.iloc[0] == pytest.approx(0.001998, rel=1e-3)
 
 
 def test_same_timestamp_tie_is_labeled_stop():

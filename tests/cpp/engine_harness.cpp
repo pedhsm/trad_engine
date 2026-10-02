@@ -1,4 +1,4 @@
-// Integration harness for HFTEngine, with NO broker connection.
+// Integration harness for TradingEngine, with NO broker connection.
 //
 // Needs the IB client in lib/client and ZeroMQ, so tests/test_cpp_engine.py only
 // runs it when both are present (it is skipped in CI). It drives the engine the
@@ -13,7 +13,7 @@
 //
 // Must run from an empty working directory (it writes data/ there). Uses the
 // engine's fixed localhost ports 5555-5559.
-#include "hft_engine.h"
+#include "engine.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,7 +51,7 @@ static void testRecording() {
     // final flush.
     ArenaAllocator a(1 << 18), b(1 << 18);
     {
-        HFTEngine engine(&a, &b, OperationMode::RECORD_LOCAL);
+        TradingEngine engine(&a, &b, OperationMode::RECORD_LOCAL);
         engine.registerAsset(1, "BOOK", stock("BOOK"), DataMode::TICK_L2);
         engine.registerAsset(2, "TOP", stock("TOP"), DataMode::TICK_L1);
         engine.registerAsset(3, "TRD", stock("TRD"), DataMode::TRADE);
@@ -122,7 +122,7 @@ static ExecutionReport nextReport(zmq::socket_t& sub) {
 
 static void testOrders() {
     ArenaAllocator a(1 << 16), b(1 << 16);
-    HFTEngine engine(&a, &b, OperationMode::LISTEN_ONLY);
+    TradingEngine engine(&a, &b, OperationMode::LISTEN_ONLY);
     PreTradeRiskLimits lim;
     lim.max_lot_size = 1;
     engine.applyRiskLimits(lim);

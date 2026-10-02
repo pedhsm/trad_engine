@@ -4,7 +4,7 @@
 // Built and run by benchmark/latency.py when lib/client and ZeroMQ are available.
 // Prints one line per percentile; runs in RECORD_LOCAL mode (so the arena path is
 // included) from whatever working directory the caller chose.
-#include "hft_engine.h"
+#include "engine.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     std::vector<long long> samples;
     samples.reserve(n);
     {
-        HFTEngine engine(&a, &b, OperationMode::RECORD_LOCAL);
+        TradingEngine engine(&a, &b, OperationMode::RECORD_LOCAL);
         engine.registerAsset(1, "BENCH", Contracts::FromConfig("BENCH", "STK", "SMART", "USD"),
                              DataMode::TRADE);
         engine.startInfrastructure("tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556");

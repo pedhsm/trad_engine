@@ -1,4 +1,4 @@
-#include "hft_engine.h"
+#include "engine.h"
 
 std::atomic<bool> global_running{true};
 
@@ -37,12 +37,12 @@ int main(int argc, char* argv[]) {
     // ==========================================
     // CLI ARGUMENT PARSING (Phase 1)
     // ==========================================
-    // Usage: .\bin\hft_engine.exe --live --mode <listen_only|record_local|record_cloud>
-    //        .\bin\hft_engine.exe --historical --mode <listen_only|record_local|record_cloud>
+    // Usage: trad_engine --live --mode <listen_only|record_local|record_cloud>
+    //        trad_engine --historical --mode <listen_only|record_local|record_cloud>
     // --mode is REQUIRED.
 
     if (argc < 4) {
-        std::cout << "Usage: .\\bin\\hft_engine.exe [--live | --historical] --mode <listen_only|record_local|record_cloud>" << std::endl;
+        std::cout << "Usage: trad_engine [--live | --historical] --mode <listen_only|record_local|record_cloud>" << std::endl;
     std::cout << "     [--config <path.json>] [--data-mode <l2|l1|trade|both>]" << std::endl;
     std::cout << "     --data-mode default: l2 (book). Use 'trade' for OHLCV bars." << std::endl;
         return 1;
@@ -95,7 +95,7 @@ int main(int argc, char* argv[]) {
     // Validation: --live or --historical is required
     if (exec_mode.empty()) {
         std::cout << "[FATAL] Neither --live nor --historical was given." << std::endl;
-        std::cout << "Usage: .\\bin\\hft_engine.exe [--live | --historical] --mode <listen_only|record_local|record_cloud>" << std::endl;
+        std::cout << "Usage: trad_engine [--live | --historical] --mode <listen_only|record_local|record_cloud>" << std::endl;
     std::cout << "     [--config <path.json>] [--data-mode <l2|l1|trade|both>]" << std::endl;
     std::cout << "     --data-mode default: l2 (book). Use 'trade' for OHLCV bars." << std::endl;
         return 1;
@@ -120,9 +120,9 @@ int main(int argc, char* argv[]) {
     // ==========================================
     std::cout << "========================================" << std::endl;
     // ASCII hyphen on purpose: the Windows console renders a UTF-8 em dash as
-    // mojibake ("HFT Engine v1.2 <garbage> IPC v3"), and this banner is the
+    // mojibake ("trad_engine v1.2 <garbage> IPC v3"), and this banner is the
     // first thing anyone watching a recording sees.
-    std::cout << "  HFT Engine v1.2 - IPC v" << IPC_PROTOCOL_VERSION << std::endl;
+    std::cout << "  trad_engine v1.2 - IPC v" << IPC_PROTOCOL_VERSION << std::endl;
     std::cout << "  Execution : " << exec_mode << std::endl;
     std::cout << "  Recording : " << record_mode << std::endl;
     std::cout << "  Data      : " << data_mode_txt << " (default; the JSON may override per asset)" << std::endl;
@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
     ArenaAllocator arena_A(1024 * 1024 * 50); // 50 MB
     ArenaAllocator arena_B(1024 * 1024 * 50); // 50 MB
 
-    HFTEngine engine(&arena_A, &arena_B, op_mode);
+    TradingEngine engine(&arena_A, &arena_B, op_mode);
 
     // ══════════════════════════════════════════════════════════════
     // CONFIGURATION LOADING (JSON Config-Driven)

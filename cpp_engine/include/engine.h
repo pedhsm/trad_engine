@@ -102,7 +102,7 @@ enum class OperationMode {
     RECORD_CLOUD    // Same as record_local + future upload flag
 };
 
-class HFTEngine: public EWrapperL0 {
+class TradingEngine: public EWrapperL0 {
     private:
         OperationMode op_mode;  // Recording mode
         EClientL0* ptr_begin;
@@ -228,7 +228,7 @@ class HFTEngine: public EWrapperL0 {
             }
         }
 
-        HFTEngine(ArenaAllocator* arena_a, ArenaAllocator* arena_b, OperationMode mode)
+        TradingEngine(ArenaAllocator* arena_a, ArenaAllocator* arena_b, OperationMode mode)
             : op_mode(mode), active_arena(0), drain_pending(false), arena_to_drain(-1),
               last_swap(std::chrono::steady_clock::now()),
               zmq_ctx(1), zmq_pub(zmq_ctx, zmq::socket_type::pub),
@@ -252,7 +252,7 @@ class HFTEngine: public EWrapperL0 {
             zmq_hb_sub.set(zmq::sockopt::rcvtimeo, 500); // wakes up to check silence
         }
 
-        ~HFTEngine(){
+        ~TradingEngine(){
             engine_running = false;
 
             // 1. Stop the broker callbacks first: after this nothing new enters
@@ -319,10 +319,10 @@ class HFTEngine: public EWrapperL0 {
             std::cout << "[ZMQ-SUB-HB] Watching strategy liveness on tcp://127.0.0.1:5559"
                       << " (silence limit: " << risk_manager.watchdogTimeoutMs() << "ms)" << std::endl;
 
-            execution_thread = std::thread(&HFTEngine::executionLoop, this);
-            thread_drain    = std::thread(&HFTEngine::drainLoop, this);
-            thread_heartbeat = std::thread(&HFTEngine::heartbeatLoop, this);
-            watchdog_thread = std::thread(&HFTEngine::watchdogLoop, this);
+            execution_thread = std::thread(&TradingEngine::executionLoop, this);
+            thread_drain    = std::thread(&TradingEngine::drainLoop, this);
+            thread_heartbeat = std::thread(&TradingEngine::heartbeatLoop, this);
+            watchdog_thread = std::thread(&TradingEngine::watchdogLoop, this);
 
             std::cout << "[PING-PONG] Double buffer active. Swap threshold: "
                       << (SWAP_THRESHOLD * 100) << "% of "

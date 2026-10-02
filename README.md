@@ -2,12 +2,10 @@
 
 **English** · [Português](README.pt-BR.md)
 
-A self-hosted, end-to-end algorithmic-trading engine you can take as a **base** and
-build a desk on top of — not a toy, not a bloated framework. A low-latency C++ market
-data / execution core, a pure-Python `core_math` layer that mirrors it under parity
-tests, a backtest engine, and — the part most open engines skip — a **serious
-validation harness** (Monte Carlo permutation tests, walk-forward, point-in-time
-invariants) so the numbers you get out are ones you can actually trust.
+A self-hosted algorithmic-trading engine: a C++ market data / execution core connected
+to Interactive Brokers, a pure-Python `core_math` layer that mirrors it under parity
+tests, a backtest engine, and a **validation harness** (Monte Carlo permutation tests,
+walk-forward, point-in-time invariants) built to catch the ways a backtest lies.
 
 Measured, not claimed: the C++ hot path adds **0.3 µs** per tick (p50), and a full
 round trip engine -> Python strategy -> engine takes **273 µs** (p50) on a laptop —

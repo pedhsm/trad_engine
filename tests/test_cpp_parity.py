@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core_math import calculos_l2, micro_math
+from core_math import l2_math, micro_math
 
 TOL = 1e-12
 SRC = Path(__file__).resolve().parents[1] / "core_math" / "cpp" / "micro.cpp"
@@ -82,7 +82,7 @@ def test_book_imbalance_matches_signal_thresholds(lib):
         wa = sum(v / (i + 1) for i, v in enumerate(asks))
         assert abs(imb - wb / (wb + wa)) <= TOL
         # The Python signal is the thresholded version of the same number.
-        sig = calculos_l2.book_imbalance_signal(
+        sig = l2_math.book_imbalance_signal(
             [(0.0, v) for v in bids], [(0.0, v) for v in asks], trigger_threshold=0.6)
         expected = "BUY" if imb >= 0.6 else ("SELL" if imb <= 0.4 else None)
         assert sig == expected
