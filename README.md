@@ -7,9 +7,14 @@ tests, a backtest engine, and — the part most open engines skip — a **seriou
 validation harness** (Monte Carlo permutation tests, walk-forward, point-in-time
 invariants) so the numbers you get out are ones you can actually trust.
 
+Measured, not claimed: the C++ hot path adds **0.3 µs** per tick (p50), and a full
+round trip engine -> Python strategy -> engine takes **273 µs** (p50) on a laptop —
+broker and network excluded, which is where the real milliseconds are
+([details](#latency)). If the strategy goes silent for 5 s, the engine cancels,
+flattens and refuses new orders on its own.
+
 > **What this is not.** This is engine + method. It ships with *example* strategies
-> (textbook Donchian breakout, Bollinger bands, a spot/futures basis model, and a
-> microstructure template). It does
+> (textbook Donchian breakout, Bollinger bands, and a microstructure template). It does
 > **not** ship anyone's alpha — bring your own signal; the engine is agnostic to it.
 
 ---
