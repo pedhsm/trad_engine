@@ -120,6 +120,15 @@ class ExecutionRiskManager {
             orders_today++;
         }
 
+        // An order the broker had reported as closed is working again (an Inactive
+        // order that came back). Counts toward the open orders, not toward orders_today:
+        // it is the same order, not a new one.
+        void registerOrderReopened(int orderId) {
+            std::lock_guard<std::mutex> lock(risk_mutex);
+            active_orders.insert(orderId);
+            open_orders = static_cast<int>(active_orders.size());
+        }
+
         void registerOrderClosed(int orderId) {
             std::lock_guard<std::mutex> lock(risk_mutex);
             active_orders.erase(orderId);

@@ -192,6 +192,36 @@ static void testOrders() {
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.orderId == 0);
 
+    // An exact repeat of a terminal status is dropped...
+    engine.orderStatus(1001, "Cancelled", 0, 1, 0.0, 0, 0, 0.0, 0, "");
+    CHECK(noReport(sub, 300));
+    // ...but a CHANGE after it is not. Cancel/fill race: the fill was already on the
+    // wire when the cancel was acknowledged. It must reach the strategy with the right
+    // ticker, and the position must follow it (+1 -> 0).
+    engine.orderStatus(1001, "Filled", 1, 0, 100.5, 0, 0, 100.5, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1001 && r.filled == 1);
+    push.send(targetMsg(1, 0), zmq::send_flags::none);          // already at 0 -> sync fill
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.orderId == 0 && r.tickerId == 1);
+
+    // Inactive is not always final (outside trading hours, held for margin): an order
+    // that comes back to life reopens, and the asset is locked again while it works.
+    push.send(targetMsg(1, 1), zmq::send_flags::none);          // 0 -> +1, id 1002
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    engine.orderStatus(1002, "Inactive", 0, 1, 0.0, 0, 0, 0.0, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_INACTIVE && r.tickerId == 1 && r.orderId == 1002);
+    engine.orderStatus(1002, "Submitted", 0, 1, 0.0, 0, 0, 0.0, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_SUBMITTED && r.tickerId == 1 && r.orderId == 1002);
+    push.send(targetMsg(1, 0), zmq::send_flags::none);          // 1002 works again: refused
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_REJECTED && r.tickerId == 1 && r.orderId == 0);
+    engine.orderStatus(1002, "Filled", 1, 0, 101.0, 0, 0, 101.0, 0, "");
+    r = nextReport(sub);
+    CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1002 && r.filled == 1);
+
     push.close();
     sub.close();
     std::printf("orders: ok\n");

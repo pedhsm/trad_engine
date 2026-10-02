@@ -201,11 +201,17 @@ class TradingEngine: public EWrapperL0 {
         std::unordered_map<int, OrderInfo> order_info;
         std::mutex order_map_mutex;
 
-        // Orders that already reached a terminal status (same mutex). IB repeats
-        // terminal statuses (on a paper account every fill arrived twice); without
-        // this, the repeat finds no entry in order_info and is reported to the
-        // strategy as an external order (tickerId -1). FIFO-bounded.
-        std::unordered_set<int> closed_orders;
+        // Orders that already reached a terminal status (same mutex), with the last
+        // status seen. IB repeats terminal statuses (on a paper account every fill
+        // arrived twice): an EXACT repeat is dropped. A CHANGE after a terminal status
+        // is real and must not be lost: a fill racing a cancel (Cancelled, then
+        // Filled), or an Inactive order coming back to life. FIFO-bounded.
+        struct ClosedOrder {
+            OrderInfo info;
+            int status;
+            int filled;
+        };
+        std::unordered_map<int, ClosedOrder> closed_orders;
         std::deque<int> closed_orders_fifo;
         static constexpr size_t CLOSED_ORDERS_KEPT = 1024;
 
@@ -501,23 +507,26 @@ class TradingEngine: public EWrapperL0 {
                 }
                 const int current_pos = it_pos->second.load();
 
-                if (req.target_position == current_pos) {
-                    // Already there: confirm, so a strategy waiting on this target unlocks.
-                    publishExecution(req.price, req.tickerId, 0, EXEC_FILLED, 0, 0);
-                    std::cout << "[SYSTEM] Target position already reached. Published sync fill for ticker "
-                              << req.tickerId << std::endl;
-                    continue;
-                }
-
                 // One order per asset at a time. The position only reflects a fill
                 // once the broker reports it; a second target computed before that
                 // would size its delta on the stale position and double the trade.
+                // Checked BEFORE "already there": with a buy 0 -> +1 working, a target
+                // of 0 equals the stale position, and confirming it would tell the
+                // strategy it is flat while the buy can still fill.
                 if (orderInFlight(req.tickerId)) {
                     std::cout << "[RISK REJECT] Ticker " << req.tickerId
                               << ": an order is still in flight. Target " << req.target_position
                               << " refused; resend after its ExecutionReport." << std::endl;
                     publishExecution(req.price, req.tickerId, 0, EXEC_REJECTED, 0,
                                      std::abs(req.target_position - current_pos));
+                    continue;
+                }
+
+                if (req.target_position == current_pos) {
+                    // Already there: confirm, so a strategy waiting on this target unlocks.
+                    publishExecution(req.price, req.tickerId, 0, EXEC_FILLED, 0, 0);
+                    std::cout << "[SYSTEM] Target position already reached. Published sync fill for ticker "
+                              << req.tickerId << std::endl;
                     continue;
                 }
 
@@ -813,15 +822,56 @@ class TradingEngine: public EWrapperL0 {
 
             // Resolve the asset and the position this order leads to. find() and
             // not operator[], which inserts and would race with the orders thread.
+            const int id = static_cast<int>(orderId);
             int orderTickerId = -1;
+            int prev_status = EXEC_OTHER;
+            bool after_terminal = false;   // a change to an order already reported closed
+            bool reopened = false;         // ...that is working again (not terminal)
             {
                 std::lock_guard<std::mutex> lock(order_map_mutex);
-                // A status for an order that already closed is a broker repeat:
-                // the strategy got the terminal report once, and that is enough.
-                if (closed_orders.count(static_cast<int>(orderId))) return;
-                auto it = order_info.find(orderId);
-                if (it != order_info.end()) {
-                    const OrderInfo info = it->second;
+                OrderInfo info{};
+                bool known = false;
+
+                auto it_closed = closed_orders.find(id);
+                if (it_closed != closed_orders.end()) {
+                    ClosedOrder& c = it_closed->second;
+                    // Exact repeat: the strategy already has this report.
+                    if (c.status == statusInt && c.filled == filled) return;
+                    after_terminal = true;
+                    prev_status = c.status;
+                    info = c.info;
+                    known = true;
+                    if (terminal) {
+                        c.status = statusInt;   // e.g. Cancelled -> Filled: still closed
+                        c.filled = filled;
+                    } else {
+                        // Working again: back in order_info, so the asset is locked
+                        // while it works. Its id stays in the FIFO; eviction tolerates
+                        // ids that are no longer (or again) in closed_orders.
+                        order_info[id] = info;
+                        closed_orders.erase(it_closed);
+                        reopened = true;
+                    }
+                } else {
+                    auto it = order_info.find(orderId);
+                    if (it != order_info.end()) {
+                        info = it->second;
+                        known = true;
+                        // Terminal state: frees the entry (unblocks the asset for the
+                        // next target) and remembers it, to recognize repeats.
+                        if (terminal) {
+                            order_info.erase(it);
+                            closed_orders[id] = ClosedOrder{info, statusInt, filled};
+                            closed_orders_fifo.push_back(id);
+                            while (closed_orders_fifo.size() > CLOSED_ORDERS_KEPT) {
+                                closed_orders.erase(closed_orders_fifo.front());
+                                closed_orders_fifo.pop_front();
+                            }
+                        }
+                    }
+                }
+
+                if (known) {
                     orderTickerId = info.tickerId;
                     if (filled > 0) {
                         // `filled` is cumulative, and the result is absolute: the
@@ -832,19 +882,17 @@ class TradingEngine: public EWrapperL0 {
                             it_pos->second.store(info.pos_at_send + info.direction * filled);
                         }
                     }
-                    // Terminal state: frees the entry (unblocks the asset for the
-                    // next target, and keeps the map from growing unbounded).
-                    if (terminal) {
-                        order_info.erase(it);
-                        closed_orders.insert(static_cast<int>(orderId));
-                        closed_orders_fifo.push_back(static_cast<int>(orderId));
-                        if (closed_orders_fifo.size() > CLOSED_ORDERS_KEPT) {
-                            closed_orders.erase(closed_orders_fifo.front());
-                            closed_orders_fifo.pop_front();
-                        }
-                    }
                 }
             }
+
+            if (after_terminal) {
+                std::cerr << "[EXECUTION] WARNING: orderId " << orderId
+                          << " changed AFTER a terminal status (" << prev_status << " -> "
+                          << statusInt << ", filled " << filled << ")"
+                          << (reopened ? ": working again, asset locked until it closes." : ".")
+                          << std::endl;
+            }
+            if (reopened) risk_manager.registerOrderReopened(id);
 
             if (orderTickerId == -1) {
                 // Order the engine did not originate (sent by hand via TWS, or a
