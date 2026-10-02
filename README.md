@@ -1,5 +1,7 @@
 # trad_engine
 
+**English** · [Português](README.pt-BR.md)
+
 A self-hosted, end-to-end algorithmic-trading engine you can take as a **base** and
 build a desk on top of — not a toy, not a bloated framework. A low-latency C++ market
 data / execution core, a pure-Python `core_math` layer that mirrors it under parity
