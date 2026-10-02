@@ -19,6 +19,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -199,6 +200,14 @@ class TradingEngine: public EWrapperL0 {
         };
         std::unordered_map<int, OrderInfo> order_info;
         std::mutex order_map_mutex;
+
+        // Orders that already reached a terminal status (same mutex). IB repeats
+        // terminal statuses (on a paper account every fill arrived twice); without
+        // this, the repeat finds no entry in order_info and is reported to the
+        // strategy as an external order (tickerId -1). FIFO-bounded.
+        std::unordered_set<int> closed_orders;
+        std::deque<int> closed_orders_fifo;
+        static constexpr size_t CLOSED_ORDERS_KEPT = 1024;
 
         zmq::context_t zmq_ctx;
         zmq::socket_t zmq_pub;
@@ -807,6 +816,9 @@ class TradingEngine: public EWrapperL0 {
             int orderTickerId = -1;
             {
                 std::lock_guard<std::mutex> lock(order_map_mutex);
+                // A status for an order that already closed is a broker repeat:
+                // the strategy got the terminal report once, and that is enough.
+                if (closed_orders.count(static_cast<int>(orderId))) return;
                 auto it = order_info.find(orderId);
                 if (it != order_info.end()) {
                     const OrderInfo info = it->second;
@@ -822,7 +834,15 @@ class TradingEngine: public EWrapperL0 {
                     }
                     // Terminal state: frees the entry (unblocks the asset for the
                     // next target, and keeps the map from growing unbounded).
-                    if (terminal) order_info.erase(it);
+                    if (terminal) {
+                        order_info.erase(it);
+                        closed_orders.insert(static_cast<int>(orderId));
+                        closed_orders_fifo.push_back(static_cast<int>(orderId));
+                        if (closed_orders_fifo.size() > CLOSED_ORDERS_KEPT) {
+                            closed_orders.erase(closed_orders_fifo.front());
+                            closed_orders_fifo.pop_front();
+                        }
+                    }
                 }
             }
 
@@ -1174,6 +1194,8 @@ class TradingEngine: public EWrapperL0 {
             const DataMode mode = tickerMode(tickerId);
 
             // ── TRADE: LAST_SIZE (5) and Delayed Last Size (71) ──────────
+            // 71 only arrives if the IB client maps it (see lib/client/README.md,
+            // "Delayed market data needs a 5-line patch").
             // Closes the pair with the price cached in tickPrice(LAST) and PUBLISHES.
             // The engine aggregates nothing: it collects, stamps and sends. The
             // 1-minute bar is built by Python (live/bar_aggregator.py), which

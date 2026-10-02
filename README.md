@@ -160,6 +160,7 @@ cmake -S cpp_engine -B build && cmake --build build
 #    and `cmake -S cpp_engine -B build -G Ninja`
 
 # 2. start IB Gateway (paper account, API on port 4002), then the engine
+#    no real-time data subscription? apply the delayed-data patch in lib/client/README.md
 ./build/trad_engine --live --mode listen_only --config examples/engine_config.example.json
 
 # 3. start the strategy with the SAME config (dry run: prints decisions, sends nothing)

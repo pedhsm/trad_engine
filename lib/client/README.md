@@ -29,5 +29,30 @@ layer). Full credit to that project; it is what made this integration straightfo
 3. Build `cpp_engine` (see `cpp_engine/CMakeLists.txt`). The include path
    `../../lib/client/*` will now resolve.
 
+## Delayed market data needs a 5-line patch
+
+Without a real-time market-data subscription (the usual case on a fresh paper
+account) IBKR sends **delayed** ticks: price types 66/67/68 instead of 1/2/4. The
+size of each tick rides on the price message, and the client is what turns it into
+a separate `tickSize` callback, but this client version only does that for the
+real-time types. The engine publishes a trade on `tickSize(LAST_SIZE)`, so on delayed
+data **no trade ever reaches the strategy**: the engine connects, reconciles and
+trades, but the bars stay empty.
+
+Fix in your local copy (found and verified live against a paper account): in
+`EClientSocketBaseImpl.h`, case `TICK_PRICE`, the `switch` that maps a price tick
+type to its size tick type ends with the `LAST` case. Add a `default` branch after it:
+
+```cpp
+default:
+    // Delayed market data: 66/67/68 (bid/ask/last) -> 69/70/71 (their sizes).
+    if (tickTypeInt >= 66 && tickTypeInt <= 68)
+        sizeTickType = (TickType)(tickTypeInt + 3);
+break;
+```
+
+With a real-time subscription you do not need it. Newer official IB API clients
+already map the delayed types.
+
 Everything in this directory except this README is git-ignored, precisely so the IB
 code you drop here never gets committed or redistributed.

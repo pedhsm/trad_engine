@@ -120,6 +120,14 @@ static ExecutionReport nextReport(zmq::socket_t& sub) {
     return r;
 }
 
+static bool noReport(zmq::socket_t& sub, int wait_ms) {
+    sub.set(zmq::sockopt::rcvtimeo, wait_ms);
+    zmq::message_t m;
+    const bool got = static_cast<bool>(sub.recv(m, zmq::recv_flags::none));
+    sub.set(zmq::sockopt::rcvtimeo, 3000);
+    return !got;
+}
+
 static void testOrders() {
     ArenaAllocator a(1 << 16), b(1 << 16);
     TradingEngine engine(&a, &b, OperationMode::LISTEN_ONLY);
@@ -153,6 +161,11 @@ static void testOrders() {
     engine.orderStatus(1000, "Filled", 1, 0, 101.0, 0, 0, 101.0, 0, "");
     r = nextReport(sub);
     CHECK(r.status == EXEC_FILLED && r.tickerId == 1 && r.orderId == 1000 && r.filled == 1);
+
+    // IB repeats terminal statuses (seen live on a paper account: every fill came
+    // twice). The repeat must not reach the strategy as an "external order" (-1).
+    engine.orderStatus(1000, "Filled", 1, 0, 101.0, 0, 0, 101.0, 0, "");
+    CHECK(noReport(sub, 300));
 
     // Target +1 again: the engine already knows it is at +1 -> sync fill, no order.
     push.send(targetMsg(1, 1), zmq::send_flags::none);

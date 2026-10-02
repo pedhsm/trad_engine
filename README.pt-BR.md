@@ -166,6 +166,7 @@ cmake -S cpp_engine -B build && cmake --build build
 #    e `cmake -S cpp_engine -B build -G Ninja`
 
 # 2. sobe o IB Gateway (conta paper, API na porta 4002) e depois o engine
+#    sem assinatura de dado em tempo real? aplique o patch de dado atrasado em lib/client/README.md
 ./build/trad_engine --live --mode listen_only --config examples/engine_config.example.json
 
 # 3. sobe a estratégia com a MESMA config (dry run: imprime decisões, não envia nada)
