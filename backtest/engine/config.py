@@ -224,11 +224,6 @@ class StrategyRegistry:
                 "class": "BollingerBands",
                 "description": "Bollinger bands mean reversion (example)"
             },
-            "example: basis": {
-                "module": "backtest.strategies._legacy.ddm_v1",
-                "class": "DDMStrategy",
-                "description": "Spot/futures basis percentile model (example; needs spot/futures columns)"
-            },
         }
         # In-memory only: do not write a registry file at import time.
 
