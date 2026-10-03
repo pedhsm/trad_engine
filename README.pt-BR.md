@@ -9,7 +9,7 @@ de permutação de Monte Carlo, walk-forward, invariantes point-in-time) feito p
 os jeitos como um backtest mente.
 
 Medido, não prometido: o caminho quente em C++ adiciona **0,3 µs** por tick (p50), e
-uma ida e volta completa engine -> estratégia Python -> engine leva **273 µs** (p50)
+uma ida e volta completa engine -> estratégia Python -> engine leva **230 µs** (p50)
 num notebook — sem contar broker e rede, que é onde estão os milissegundos de verdade
 ([detalhes](#latência)). Se a estratégia ficar muda por 5 s, o engine cancela as
 ordens, zera as posições e passa a recusar ordens novas sozinho.
@@ -183,16 +183,20 @@ diária for atingido.
 
 `python -m benchmark.latency` mede o caminho live tick -> ordem, componente por
 componente, com todo tick virando uma ordem (pior caso). Num notebook (AMD Ryzen 5
-5600H, Windows 11, Python 3.12), em microssegundos:
+5600H, Windows 11, Python 3.12) na tomada, mediana de 100 execuções, em microssegundos:
 
-| componente | p50 | p99 | p99.9 |
-|---|---:|---:|---:|
-| (A) caminho quente do engine, C++: callback do broker -> registro na arena -> publicação ZMQ | 0,3 | 0,5 | 3,2 |
-| (B1) framework da estratégia, Python: decode -> barra -> encode | 4,1 | 7,0 | 29,7 |
-| (B2) sinal de exemplo (cruzamento de SMA) | 8,6 | 13,6 | 56,0 |
-| (C) ida e volta entre processos: engine -> ZMQ -> estratégia -> ZMQ -> engine | 273 | 435 | 487 |
+| componente | p50 | p50 entre execuções (5–95%) | p99 | p99.9 |
+|---|---:|---:|---:|---:|
+| (A) caminho quente do engine, C++: callback do broker -> registro na arena -> publicação ZMQ | 0,3 | 0,3 – 0,3 | 0,5 | 2,8 |
+| (B1) framework da estratégia, Python: decode -> barra -> encode | 4,0 | 4,0 – 4,1 | 6,7 | 26,5 |
+| (B2) sinal de exemplo (cruzamento de SMA) | 8,5 | 8,4 – 8,6 | 13,5 | 27,2 |
+| (C) ida e volta entre processos: engine -> ZMQ -> estratégia -> ZMQ -> engine | 230 | 227 – 233 | 409 | 467 |
 
-p50 é o tick mediano; p99 é o valor que só 1 tick em 100 ultrapassa. A contribuição
+p50 é o tick mediano; p99 é o valor que só 1 tick em 100 ultrapassa. Cada execução
+mede 5.000 ticks (100.000 para o (A)); a coluna "entre execuções" mostra quanto o p50
+varia de uma execução para outra. A energia importa: numa execução na bateria, a
+economia de energia do Windows praticamente dobrou o (C) (554 µs no p50), porque os
+processos demoram mais para acordar. A contribuição
 do próprio engine é dominada pelos dois saltos de ZMQ no localhost e pelo tempo de os
 processos acordarem em (C), não por cálculo. O que isto **não** inclui é o broker e a
 rede (IB Gateway <-> bolsa), que são milissegundos e engolem tudo acima — então esses

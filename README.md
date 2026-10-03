@@ -8,7 +8,7 @@ tests, a backtest engine, and a **validation harness** (Monte Carlo permutation 
 walk-forward, point-in-time invariants) built to catch the ways a backtest lies.
 
 Measured, not claimed: the C++ hot path adds **0.3 µs** per tick (p50), and a full
-round trip engine -> Python strategy -> engine takes **273 µs** (p50) on a laptop —
+round trip engine -> Python strategy -> engine takes **230 µs** (p50) on a laptop —
 broker and network excluded, which is where the real milliseconds are
 ([details](#latency)). If the strategy goes silent for 5 s, the engine cancels,
 flattens and refuses new orders on its own.
@@ -177,16 +177,19 @@ goes silent or the daily loss limit is hit.
 
 `python -m benchmark.latency` measures the live path tick -> order, component by
 component, with every tick turned into an order (worst case). On a laptop (AMD Ryzen 5
-5600H, Windows 11, Python 3.12), in microseconds:
+5600H, Windows 11, Python 3.12) on AC power, median of 100 runs, in microseconds:
 
-| component | p50 | p99 | p99.9 |
-|---|---:|---:|---:|
-| (A) engine hot path, C++: broker callback -> arena record -> ZMQ publish | 0.3 | 0.5 | 3.2 |
-| (B1) strategy framework, Python: decode -> bar -> encode | 4.1 | 7.0 | 29.7 |
-| (B2) example signal (SMA cross) | 8.6 | 13.6 | 56.0 |
-| (C) round trip across processes: engine -> ZMQ -> strategy -> ZMQ -> engine | 273 | 435 | 487 |
+| component | p50 | p50 across runs (5–95%) | p99 | p99.9 |
+|---|---:|---:|---:|---:|
+| (A) engine hot path, C++: broker callback -> arena record -> ZMQ publish | 0.3 | 0.3 – 0.3 | 0.5 | 2.8 |
+| (B1) strategy framework, Python: decode -> bar -> encode | 4.0 | 4.0 – 4.1 | 6.7 | 26.5 |
+| (B2) example signal (SMA cross) | 8.5 | 8.4 – 8.6 | 13.5 | 27.2 |
+| (C) round trip across processes: engine -> ZMQ -> strategy -> ZMQ -> engine | 230 | 227 – 233 | 409 | 467 |
 
-p50 is the median tick; p99 is what only 1 tick in 100 exceeds. The engine's own
+p50 is the median tick; p99 is what only 1 tick in 100 exceeds. Each run measures
+5,000 ticks (100,000 for (A)); the "across runs" column is how much a run's p50 moves
+from one run to the next. Power matters: in a single run on battery, Windows power
+saving roughly doubled (C) (554 µs p50), because process wake-ups get slower. The engine's own
 contribution is dominated by the two localhost ZMQ hops and the process wake-ups in
 (C), not by compute. What this does **not** include is the broker and the network
 (IB Gateway <-> exchange), which are milliseconds and dwarf all of the above — so
