@@ -196,6 +196,27 @@ contribution is dominated by the two localhost ZMQ hops and the process wake-ups
 these numbers say "the engine is not the bottleneck", not "this is an HFT stack".
 They depend on the machine; rerun them on yours.
 
+## Known limitations
+
+Things I know are missing or wrong, and how I plan to fix them:
+
+- **No per-asset position or notional limit.** `max_lot_size` caps a single order,
+  not the position: a strategy can step up 50 lots at a time until the daily order
+  limit stops it. Plan: `max_position` per asset and a gross notional cap, checked
+  in `approveTargetOrder`.
+- **The loss limit is not a true daily PnL.** It sums the realized/unrealized PnL
+  from `updatePortfolio`, which runs since each position was opened, not since the
+  session started: an overnight position can trip it with yesterday's loss, or hide
+  today's with yesterday's gain. Plan: use IB's `reqPnL` (daily PnL).
+- **Halt & Liquidate fires once and does not verify.** If the flattening order is
+  rejected (e.g. market closed), nothing retries it; and pending orders are cancelled
+  while the flattening orders go out, so one that fills in between can leave a
+  residual position. Plan: a flatten loop that re-reads the broker position until flat.
+- **Backtest numbers are not all on the same basis.** The in-sample MCPT charges
+  costs, the walk-forward MCPT does not; `trade_metrics` fills on the signal bar's
+  close while the MCPT trades one bar later. Plan: one shared return function
+  (signal shift + costs) used by every path.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party components keep their own licenses (the IBKR
