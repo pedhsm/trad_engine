@@ -203,6 +203,29 @@ rede (IB Gateway <-> bolsa), que são milissegundos e engolem tudo acima — ent
 números dizem "o engine não é o gargalo", não "isto é uma stack de HFT". Eles dependem
 da máquina; rode de novo na sua.
 
+## Limitações conhecidas
+
+O que eu sei que falta ou está errado, e como pretendo corrigir:
+
+- **Sem limite de posição nem de notional por ativo.** O `max_lot_size` limita uma
+  ordem, não a posição: a estratégia pode subir de 50 em 50 lotes até o limite diário
+  de ordens barrar. Plano: `max_position` por ativo e teto de notional bruto,
+  checados no `approveTargetOrder`.
+- **O limite de perda não é um PnL diário de verdade.** Ele soma o PnL realizado e
+  não realizado do `updatePortfolio`, que conta desde a abertura de cada posição, não
+  desde o início da sessão: uma posição carregada de ontem pode disparar o limite com
+  a perda de ontem, ou esconder a de hoje com o ganho de ontem. Plano: usar o
+  `reqPnL` da IB (PnL diário).
+- **O Halt & Liquidate dispara uma vez e não confere o resultado.** Se a ordem de
+  zeragem for rejeitada (ex.: mercado fechado), nada tenta de novo; e as ordens
+  pendentes são canceladas enquanto a zeragem sai, então uma que execute no meio pode
+  deixar posição residual. Plano: um loop de zeragem que relê a posição na corretora
+  até zerar.
+- **Os números do backtest não estão na mesma base.** O MCPT in-sample cobra custos,
+  o walk-forward não; o `trade_metrics` executa no fechamento do próprio candle do
+  sinal, enquanto o MCPT opera um candle depois. Plano: uma única função de retorno
+  (defasagem do sinal + custos) usada por todos os caminhos.
+
 ## Licença
 
 MIT — veja [LICENSE](LICENSE). Componentes de terceiros mantêm suas próprias licenças
